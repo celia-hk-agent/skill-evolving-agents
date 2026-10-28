@@ -72,6 +72,49 @@ Profiles may also set an agent-call budget. The runner reserves calls atomically
 before launching a hosted session and writes `logs/agent-call-budget.json`.
 Once `hard_agent_call_cap` is reached, no additional paid agent session starts.
 
+### Configurable funnel targets
+
+Use `profiles/action-oriented-local-service.json` when the purpose of a run is
+to exercise the complete evolution funnel rather than minimize calls. Its
+`evolution_gate.diagnosis_target_rate` and `maximum_diagnosis_scopes` control
+how many selected findings may reach Diagnosis; the agent-call cap remains the
+hard safety boundary. `funnel_targets` are optimization objectives, not quotas
+that can override evidence, verification, idempotency, or Judge.
+
+`logs/phase-metrics.json` reports these rates and their target deltas:
+
+- `diagnosis_rate`: diagnosed findings / selected findings.
+- `goal_decision_rate`: Goal decisions, including evidence-backed no-change /
+  selected findings.
+- `action_scope_rate`: scopes proposing at least one operation / selected
+  findings.
+- `novel_action_scope_rate`: action scopes / Goal scopes that were not exact
+  replays of an already-applied finding. This is the primary action objective;
+  excluding idempotent replay prevents duplicate edits made only to hit a rate.
+- `proposal_rate` and `novel_proposal_rate`: operations proposed against the
+  corresponding selected or novel denominator.
+- `final_acceptance_rate` and `novel_final_acceptance_rate`: accepted
+  operations against those denominators.
+- `proposal_acceptance_rate`: accepted / proposed operations.
+
+The same report includes distributions for operations per scope, proposed
+operation type, accepted operation type, idempotent replay scopes, and target
+status (`met`, `missed`, `converged`, or `unavailable`). It also reports
+fixed-key operation breakdowns per phase: `goal.proposed_by_operation`,
+`optimize.changed_by_operation`, `verify.operations_by_operation`,
+`verify.passed_by_operation`, `verify.skipped_by_operation`, and the matching
+Judge decision/pass/accepted maps. Keys are always present for create, update,
+merge, split, delete, no_change, and unknown, so a zero merge/split/delete is
+measured rather than omitted. A suppressed resource
+opportunity whose reason is `equivalent-resource-exists` or
+`equivalent-existing-script` is already-applied evidence, not a failed
+proposal. When a run has no changed scope, no accepted operation, and at least
+one exact or resource-level replay, `funnel.converged_replay` is true and
+consumer targets report `converged` instead of `missed`. Diagnosis and Goal
+coverage targets still apply. `funnel.run_disposition` is `changed`,
+`converged`, or `no_change`. A missed target is a tuning signal; it must never
+cause the pipeline to fabricate an action or weaken verification.
+
 ### Trace-free inventory maintenance
 
 Use `--inventory-only` to inspect and improve the current candidate skill
@@ -176,7 +219,11 @@ bundle and writes a rollback record.
 
 Place immutable held-out cases at
 `evaluation/held_out/<skill>.json` inside the run workspace and configure
-`SKILL_EVOLVER_REPLAY_COMMAND`. The command receives one JSON request on stdin
+`SKILL_EVOLVER_REPLAY_COMMAND`. Verifier evidence is capped at 18,000
+characters by default; set `SKILL_EVOLVER_VERIFIER_EVIDENCE_CHARS` to a value
+between 4,000 and the previous 26,000-character ceiling when a larger bundle is
+required. Individual resource excerpts are capped at 8,000 characters. The
+command receives one JSON request on stdin
 for each `without_skill` and `with_skill` case and must return a JSON object
 with boolean `passed` and `activated` fields; numeric token, tool-call, error,
 and timing fields are optional. The runner creates and validates the replay
@@ -194,6 +241,21 @@ evidence reach agents. Trace strings remain untrusted data; redaction is not an
 instruction interpreter. Use `--tenant <id>` to place run state, inventory,
 metrics, and optimization data below `workspace/tenants/<id>/`; tenant IDs are
 validated before path resolution and traversal values are rejected.
+
+Reference opportunities in the same source directory are consolidated before
+selection. One directory-level or document-level index is selected for that
+tree; the others are marked `deduplicated` with reason
+`overlapping-reference-source`. This prevents several near-identical reference
+skills from being proposed for one documentation tree. Findings in different
+trees remain independent.
+
+A qualified resource finding with confidence at or above `0.94`, a complete
+resource contract, and the detector's false-positive guards uses a compact
+deterministic Diagnosis instead of a hosted Diagnosis call. The Goal,
+Optimize, Verify, and Judge phases still run normally. Set
+`resource_opportunities.deterministic_diagnosis` to `false` in
+`common/preprocessing-config.json` to require a hosted Diagnosis for every
+finding.
 
 Repeated resource opportunities have a conservative single-session creation
 gate. By default it requires confidence `>= 0.90`, at least three occurrences
@@ -471,7 +533,7 @@ the saved content differs; a deletion therefore cannot silently overwrite its
 rollback source.
 
 The inactive Hermes and OpenClaw examples use the local Recursive Flint model.
-Load `/Users/maybewu/Documents/Projects/myexpore/recursive/.env` in the shell,
+Load the Recursive checkout's local `.env` in the shell,
 then configure the CLI provider with `FLINT_BASE_URL` and `FLINT_API_KEY`.
 Hermes uses its configured `HERMES_HOME`; OpenClaw uses
 `OPENCLAW_CONFIG_PATH` and `OPENCLAW_STATE_DIR`. The runner inherits those
@@ -533,9 +595,11 @@ Replaying an already-applied finding is idempotent. Before Goal, the runner
 scans every current inventory changelog for that exact finding ID; this check
 does not depend on which skills semantic recall happens to return. A match
 writes a deterministic `no_change` and skips Goal, Optimize, Verify, and Judge
-agent calls. A failed selected Diagnosis or Goal lane is never converted into
-`no_change`: the run fails explicitly while preserving its status and timing
-artifacts for retry.
+agent calls. A resource opportunity is also idempotent when the detector finds
+an equivalent authored resource or script; it is suppressed before it can
+become a new finding. A failed selected Diagnosis or Goal lane is never
+converted into `no_change`: the run fails explicitly while preserving its
+status and timing artifacts for retry.
 
 `logs/run-timing.json` reports conservative agent-call savings. The actual
 count comes from recorded LLM spans. Each mined finding deferred by the

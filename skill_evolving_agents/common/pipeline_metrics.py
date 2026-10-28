@@ -23,6 +23,23 @@ except ImportError:
 
 _LOCK = threading.RLock()
 _INT31 = 0x7FFFFFFF
+OPERATION_KINDS = (
+    "create",
+    "update",
+    "merge",
+    "split",
+    "delete",
+    "no_change",
+)
+
+
+def _operation_counts() -> dict[str, int]:
+    return {kind: 0 for kind in (*OPERATION_KINDS, "unknown")}
+
+
+def _add_operation(counts: dict[str, int], kind: object) -> None:
+    name = str(kind or "unknown")
+    counts[name if name in counts else "unknown"] += 1
 
 
 def trace_pid(run_id: str) -> int:
@@ -677,6 +694,79 @@ def collect_phase_metrics(
         if isinstance(pipeline_summary, dict)
         else []
     )
+    run_root = workspace / "run"
+    proposed_by_operation = _operation_counts()
+    operation_kind_by_scope: dict[tuple[str, str], str] = {}
+    for path in sorted(run_root.glob("*/evolve-goal.json")):
+        try:
+            goal = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        action = goal.get("action") if isinstance(goal, dict) else None
+        ops = action.get("ops") if isinstance(action, dict) else []
+        if not isinstance(ops, list) or not ops:
+            _add_operation(proposed_by_operation, "no_change")
+            continue
+        cluster = path.parent.name
+        for index, op in enumerate(ops, start=1):
+            if not isinstance(op, dict):
+                continue
+            kind = str(op.get("op") or "unknown")
+            _add_operation(proposed_by_operation, kind)
+            operation_kind_by_scope[(cluster, str(index))] = kind
+    changed_by_operation = _operation_counts()
+    for path in sorted(run_root.glob("*/ops/*/changelog.json")):
+        try:
+            changelog = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        for change in changelog.get("changes") or []:
+            if isinstance(change, dict):
+                _add_operation(changed_by_operation, change.get("operation"))
+    verify_operations_by_operation = _operation_counts()
+    verify_passed_by_operation = _operation_counts()
+    verify_skipped_by_operation = _operation_counts()
+    judge_decisions_by_operation = _operation_counts()
+    judge_passed_by_operation = _operation_counts()
+    accepted_by_operation = _operation_counts()
+    for path in sorted(run_root.glob("*/ops/*/verification.json")):
+        cluster = path.parents[2].name
+        kind = operation_kind_by_scope.get((cluster, path.parent.name), "unknown")
+        _add_operation(verify_operations_by_operation, kind)
+        try:
+            verification = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(verification, dict):
+            skipped = verification.get("status") == "skipped"
+            if skipped:
+                _add_operation(verify_skipped_by_operation, kind)
+            feedback = verification.get("feedback")
+            if (
+                not skipped
+                and isinstance(feedback, dict)
+                and feedback.get("overall_status") == "pass"
+            ):
+                _add_operation(verify_passed_by_operation, kind)
+    for path in sorted(run_root.glob("*/ops/*/judge.json")):
+        cluster = path.parents[2].name
+        kind = operation_kind_by_scope.get((cluster, path.parent.name), "unknown")
+        _add_operation(judge_decisions_by_operation, kind)
+        try:
+            judge = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(judge, dict) and judge.get("status") == "pass":
+            _add_operation(judge_passed_by_operation, kind)
+    for path in sorted(run_root.glob("*/ops/*/publication.json")):
+        cluster = path.parents[2].name
+        kind = operation_kind_by_scope.get((cluster, path.parent.name), "unknown")
+        try:
+            publication = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(publication, dict) and publication.get("accepted") is True:
+            _add_operation(accepted_by_operation, kind)
     changed_scopes = sum(
         isinstance(scope, dict) and scope.get("disposition") != "no_change"
         for scope in scopes
@@ -685,10 +775,121 @@ def collect_phase_metrics(
         isinstance(scope, dict) and scope.get("disposition") == "no_change"
         for scope in scopes
     )
+    idempotent_scopes = sum(
+        isinstance(scope, dict)
+        and "exact finding was already applied" in str(scope.get("reason") or "").lower()
+        for scope in scopes
+    )
     accepted = sum(
         isinstance(operation, dict) and operation.get("accepted") is True
         for operation in operations
     )
+    resource_decisions = _read_jsonl(
+        signal_root / "resource-opportunity-decisions.jsonl"
+    )
+    converged_resource_opportunities = sum(
+        isinstance(row, dict)
+        and row.get("disposition") in {"suppressed", "rejected"}
+        and bool(
+            {"equivalent-resource-exists", "equivalent-existing-script"}
+            & {
+                str(code)
+                for code in (row.get("reason_codes") or [])
+                if isinstance(code, str)
+            }
+        )
+        for row in resource_decisions
+    )
+    # A replay can converge before Goal: the detector suppresses a resource
+    # whose authored equivalent already exists, so the finding never becomes a
+    # scope. That is idempotency, not a failure to propose an action. Keep the
+    # raw acceptance counts honest but mark consumer targets as converged.
+    converged_replay = (
+        changed_scopes == 0
+        and accepted == 0
+        and (idempotent_scopes + converged_resource_opportunities) > 0
+    )
+    novel_goal_scopes = max(len(scopes) - idempotent_scopes, 0)
+    profile = _read_json(workspace / "run/config/pipeline-profile.json")
+    funnel_targets = (
+        profile.get("funnel_targets") or []
+        if isinstance(profile, dict)
+        else {}
+    )
+    if not isinstance(funnel_targets, dict):
+        funnel_targets = {}
+    action_count_distribution: dict[str, int] = defaultdict(int)
+    for scope in scopes:
+        if isinstance(scope, dict):
+            action_count_distribution[str(int(scope.get("operation_count") or 0))] += 1
+    operation_type_distribution: dict[str, int] = defaultdict(int)
+    accepted_operation_type_distribution: dict[str, int] = defaultdict(int)
+    for operation in operations:
+        if isinstance(operation, dict):
+            operation_type = str(
+                operation.get("op")
+                or operation.get("operation")
+                or operation.get("action")
+                or "unknown"
+            )
+            operation_type_distribution[operation_type] += 1
+            if operation.get("accepted") is True:
+                accepted_operation_type_distribution[operation_type] += 1
+
+    funnel_rates = {
+        "diagnosis_rate": _rate(len(diagnoses), selected),
+        "goal_decision_rate": _rate(len(scopes), selected),
+        "action_scope_rate": _rate(changed_scopes, selected),
+        "action_given_goal_rate": _rate(changed_scopes, len(scopes)),
+        "novel_action_scope_rate": _rate(changed_scopes, novel_goal_scopes),
+        "proposal_rate": _rate(len(operations), selected),
+        "proposal_given_goal_rate": _rate(len(operations), len(scopes)),
+        "novel_proposal_rate": _rate(len(operations), novel_goal_scopes),
+        "final_acceptance_rate": _rate(accepted, selected),
+        "acceptance_given_goal_rate": _rate(accepted, len(scopes)),
+        "novel_final_acceptance_rate": _rate(accepted, novel_goal_scopes),
+        "proposal_acceptance_rate": _rate(accepted, len(operations)),
+    }
+    consumer_targets = {
+        "action_scope_rate",
+        "action_given_goal_rate",
+        "novel_action_scope_rate",
+        "proposal_rate",
+        "proposal_given_goal_rate",
+        "novel_proposal_rate",
+        "final_acceptance_rate",
+        "acceptance_given_goal_rate",
+        "novel_final_acceptance_rate",
+        "proposal_acceptance_rate",
+    }
+    target_evaluation = {}
+    for name, target in funnel_targets.items():
+        if name not in funnel_rates or not isinstance(target, (int, float)):
+            continue
+        actual = funnel_rates[name]
+        if converged_replay and name in consumer_targets:
+            target_evaluation[name] = {
+                "target": float(target),
+                "actual": actual,
+                "delta": None,
+                "status": "converged",
+                "applicable": False,
+            }
+            continue
+        target_evaluation[name] = {
+            "target": float(target),
+            "actual": actual,
+            "delta": (
+                round(float(actual) - float(target), 6)
+                if actual is not None
+                else None
+            ),
+            "status": (
+                "met"
+                if actual is not None and float(actual) >= float(target)
+                else "missed" if actual is not None else "unavailable"
+            ),
+        }
 
     reduction = _read_json(workspace / "run/goal-reduction.json")
     reduction_decisions = (
@@ -783,6 +984,22 @@ def collect_phase_metrics(
         warnings.append(
             f"{len(matching_files) - matched_scopes}/{len(matching_files)} scopes had no recalled skill"
         )
+    missed_targets = [
+        name
+        for name, result in target_evaluation.items()
+        if result["status"] == "missed"
+    ]
+    if converged_replay:
+        warnings.append(
+            "converged replay: "
+            f"{idempotent_scopes} exact finding scope(s) and "
+            f"{converged_resource_opportunities} equivalent resource "
+            "opportunit(ies) were already applied"
+        )
+    if missed_targets:
+        warnings.append(
+            "funnel targets missed: " + ", ".join(sorted(missed_targets))
+        )
 
     return {
         "schema_version": 1,
@@ -860,7 +1077,16 @@ def collect_phase_metrics(
                 "scopes": len(scopes),
                 "changed_scopes": changed_scopes,
                 "no_change_scopes": no_change_scopes,
+                "idempotent_replay_scopes": idempotent_scopes,
+                "idempotent_resource_opportunities": converged_resource_opportunities,
+                "converged_replay": converged_replay,
+                "run_disposition": (
+                    "changed"
+                    if changed_scopes
+                    else "converged" if converged_replay else "no_change"
+                ),
                 "operations": len(operations),
+                "proposed_by_operation": dict(proposed_by_operation),
                 "reduction_decisions": dict(sorted(reduction_counts.items())),
                 "min_super_score": (
                     float(reduction.get("min_super_score") or 0)
@@ -883,6 +1109,7 @@ def collect_phase_metrics(
                     optimize_attempt_twos,
                     optimize_first_attempts,
                 ),
+                "changed_by_operation": dict(changed_by_operation),
                 "quality": None,
                 "quality_reason": "edit completion is not behavioral improvement",
             },
@@ -909,6 +1136,11 @@ def collect_phase_metrics(
                 "structural_pass_rate": _rate(
                     verification_passes, len(verifications)
                 ),
+                "operations_by_operation": dict(
+                    verify_operations_by_operation
+                ),
+                "passed_by_operation": dict(verify_passed_by_operation),
+                "skipped_by_operation": dict(verify_skipped_by_operation),
                 "replay_available": replay_available,
                 "replay_coverage": _rate(replay_available, len(verifications)),
                 "replay_passes": replay_passes,
@@ -927,6 +1159,9 @@ def collect_phase_metrics(
                 ),
                 "proposed_operations": len(operations),
                 "accepted_proposals": accepted,
+                "decisions_by_operation": dict(judge_decisions_by_operation),
+                "passed_by_operation": dict(judge_passed_by_operation),
+                "accepted_by_operation": dict(accepted_by_operation),
                 "proposal_acceptance_rate": _rate(accepted, len(operations)),
                 "note": (
                     "proposals include bundled operations; judge decisions and "
@@ -941,6 +1176,26 @@ def collect_phase_metrics(
             "changed_scopes": changed_scopes,
             "proposed_operations": len(operations),
             "accepted_proposals": accepted,
+            "idempotent_replay_scopes": idempotent_scopes,
+            "idempotent_resource_opportunities": converged_resource_opportunities,
+            "converged_replay": converged_replay,
+            "run_disposition": (
+                "changed"
+                if changed_scopes
+                else "converged" if converged_replay else "no_change"
+            ),
+            "novel_goal_scopes": novel_goal_scopes,
+            "rates": funnel_rates,
+            "action_count_distribution": dict(
+                sorted(action_count_distribution.items(), key=lambda row: int(row[0]))
+            ),
+            "operation_type_distribution": dict(
+                sorted(operation_type_distribution.items())
+            ),
+            "accepted_operation_type_distribution": dict(
+                sorted(accepted_operation_type_distribution.items())
+            ),
+            "targets": target_evaluation,
         },
         "warnings": warnings,
     }
@@ -975,6 +1230,17 @@ def aggregate_phase_metrics(runs_root: Path) -> dict[str, Any]:
             )
             for report in reports
         )
+
+    def operation_total(phase: str, key: str) -> dict[str, int]:
+        counts = _operation_counts()
+        for report in reports:
+            values = (((report.get("phases") or {}).get(phase) or {}).get(key))
+            if not isinstance(values, dict):
+                continue
+            for name, count in values.items():
+                target = str(name) if str(name) in counts else "unknown"
+                counts[target] += int(count or 0)
+        return counts
 
     mining_findings = total("mining", "findings")
     mining_selected = total("mining", "selected")
@@ -1018,6 +1284,23 @@ def aggregate_phase_metrics(runs_root: Path) -> dict[str, Any]:
                 "changed_scopes": total("goal", "changed_scopes"),
                 "no_change_scopes": total("goal", "no_change_scopes"),
                 "operations": total("goal", "operations"),
+                "proposed_by_operation": operation_total(
+                    "goal", "proposed_by_operation"
+                ),
+                "idempotent_replay_scopes": total(
+                    "goal", "idempotent_replay_scopes"
+                ),
+                "idempotent_resource_opportunities": total(
+                    "goal", "idempotent_resource_opportunities"
+                ),
+                "converged_replay_runs": sum(
+                    bool(
+                        ((report.get("phases") or {}).get("goal") or {}).get(
+                            "converged_replay"
+                        )
+                    )
+                    for report in reports
+                ),
                 "runs_with_active_score_gate": sum(
                     (
                         ((report.get("phases") or {}).get("goal") or {}).get(
@@ -1032,6 +1315,9 @@ def aggregate_phase_metrics(runs_root: Path) -> dict[str, Any]:
             "optimize": {
                 "operations_started": total("optimize", "operations_started"),
                 "second_attempts": total("optimize", "second_attempts"),
+                "changed_by_operation": operation_total(
+                    "optimize", "changed_by_operation"
+                ),
                 "retry_rate": _rate(
                     total("optimize", "second_attempts"),
                     total("optimize", "operations_started"),
@@ -1063,6 +1349,15 @@ def aggregate_phase_metrics(runs_root: Path) -> dict[str, Any]:
                 "structural_pass_rate": _rate(
                     total("verify", "structural_passes"), verify_operations
                 ),
+                "operations_by_operation": operation_total(
+                    "verify", "operations_by_operation"
+                ),
+                "passed_by_operation": operation_total(
+                    "verify", "passed_by_operation"
+                ),
+                "skipped_by_operation": operation_total(
+                    "verify", "skipped_by_operation"
+                ),
                 "replay_available": replay_available,
                 "replay_coverage": _rate(replay_available, verify_operations),
                 "behavioral_pass_rate": (
@@ -1074,6 +1369,15 @@ def aggregate_phase_metrics(runs_root: Path) -> dict[str, Any]:
             "judge": {
                 "proposed_operations": proposed,
                 "accepted_proposals": accepted,
+                "decisions_by_operation": operation_total(
+                    "judge", "decisions_by_operation"
+                ),
+                "passed_by_operation": operation_total(
+                    "judge", "passed_by_operation"
+                ),
+                "accepted_by_operation": operation_total(
+                    "judge", "accepted_by_operation"
+                ),
                 "proposal_acceptance_rate": _rate(accepted, proposed),
                 "first_attempt_passes": total(
                     "judge", "first_attempt_passes"
