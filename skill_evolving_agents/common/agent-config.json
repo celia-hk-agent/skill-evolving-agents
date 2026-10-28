@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "agents": [
+    {
+      "backend": "cursor",
+      "model": "grok-4.7-low",
+      "status": "inactive"
+    },
+    {
+      "backend": "claude",
+      "model": "haiku",
+      "status": "inactive"
+    },
+    {
+      "backend": "codex",
+      "model": "gpt-6-luna",
+      "status": "active"
+    },
+    {
+      "backend": "dsh",
+      "model": "flint",
+      "status": "inactive"
+    },
+    {
+      "backend": "hermes",
+      "model": "flint",
+      "status": "inactive"
+    },
+    {
+      "backend": "openclaw",
+      "model": "flint-local/flint",
+      "status": "inactive"
+    },
+    {
+      "backend": "docker-claude",
+      "model": "haiku",
+      "status": "inactive"
+    }
+  ]
+}

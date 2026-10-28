@@ -1,0 +1,304 @@
+{
+  "schema_version": 1,
+  "run_id": "run-example",
+  "finding_id": "finding-example",
+  "op_index": 1,
+  "operation": "update",
+  "scoring": {
+    "strategy_version": 1,
+    "scale": {
+      "min": 0.0,
+      "max": 1.0
+    },
+    "assertion_score_anchors": {
+      "0.0": "Contradicted, missing, or unsupported.",
+      "0.25": "Major gaps; most of the assertion is unsatisfied.",
+      "0.5": "Partially satisfied with material gaps.",
+      "0.75": "Satisfied with concrete evidence.",
+      "1.0": "Fully satisfied with strong, specific evidence and no observed gap."
+    },
+    "pass_threshold": 0.75,
+    "step_aggregation": "arithmetic_mean",
+    "skill_aggregation": "penalty_sum",
+    "overall_aggregation": "minimum",
+    "required_assertion_policy": "soft_penalty",
+    "required_step_policy": "score_threshold",
+    "replay_policy": "soft_penalty",
+    "round_digits": 6,
+    "soft_penalties": {
+      "claim_budget": 0.8,
+      "quality_budget": 0.2,
+      "replay_share": 2,
+      "core_sections": 8,
+      "directories": 5
+    },
+    "formulas": {
+      "step_score": "sum(assertion_scores) / count(assertion_scores)",
+      "skill_score": "max(0, 1 - claim_penalties - min(quality_penalties, quality_budget) - replay_penalty)",
+      "overall_score": "min(skill_scores)",
+      "claim_share": "claim_budget / max(1, claimed_sections + claimed_directories)",
+      "quality_share": "quality_budget / 4",
+      "replay_penalty": "(1 - pass_threshold) / replay_share",
+      "step_status": "pass iff step_score >= pass_threshold",
+      "skill_status": "pass iff skill_score >= pass_threshold",
+      "overall_status": "pass iff overall_score >= pass_threshold"
+    },
+    "step_weights": {
+      "step1": 0.12,
+      "step2": 0.16,
+      "step3": 0.1,
+      "step4": 0.1,
+      "step5": 0.14,
+      "step6": 0.16,
+      "step7": 0.11,
+      "step8": 0.11
+    }
+  },
+  "skills": [
+    {
+      "skill": "example-skill",
+      "role": "updated",
+      "baseline_expected": true,
+      "candidate_expected": true,
+      "requirements": {
+        "sections": [
+          {
+            "section": "workflow",
+            "expectation": "Add a deterministic validation step."
+          }
+        ],
+        "directories": [
+          {
+            "directory": "references",
+            "expectation": "Keep the reusable checklist in references."
+          }
+        ],
+        "avoid": [
+          "Do not hard-code the triggering project or provider."
+        ],
+        "removals": [
+          "Delete the duplicated legacy checklist."
+        ]
+      },
+      "checks": [
+        {
+          "id": "step1",
+          "definition_ref": "#/checks/step1",
+          "applicable": true,
+          "assertions": []
+        },
+        {
+          "id": "step2",
+          "definition_ref": "#/checks/step2",
+          "applicable": true,
+          "assertions": [
+            {
+              "id": "step2-goal-example-section",
+              "text": "Section workflow: Add a deterministic validation step.",
+              "source_ref": "#/skills/0/requirements/sections/0"
+            },
+            {
+              "id": "step2-goal-example-directory",
+              "text": "Directory references: Keep the reusable checklist in references.",
+              "source_ref": "#/skills/0/requirements/directories/0"
+            },
+            {
+              "id": "step2-goal-example-avoid",
+              "text": "Forbidden outcome is absent: Do not hard-code the triggering project or provider.",
+              "source_ref": "#/skills/0/requirements/avoid/0"
+            },
+            {
+              "id": "step2-goal-example-removal",
+              "text": "Required removal is applied: Delete the duplicated legacy checklist.",
+              "source_ref": "#/skills/0/requirements/removals/0"
+            }
+          ]
+        },
+        {
+          "id": "step3",
+          "definition_ref": "#/checks/step3",
+          "applicable": true,
+          "assertions": []
+        },
+        {
+          "id": "step4",
+          "definition_ref": "#/checks/step4",
+          "applicable": true,
+          "assertions": []
+        },
+        {
+          "id": "step5",
+          "definition_ref": "#/checks/step5",
+          "applicable": true,
+          "assertions": []
+        },
+        {
+          "id": "step6",
+          "definition_ref": "#/checks/step6",
+          "applicable": true,
+          "assertions": []
+        },
+        {
+          "id": "step7",
+          "definition_ref": "#/checks/step7",
+          "applicable": true,
+          "assertions": []
+        },
+        {
+          "id": "step8",
+          "definition_ref": "#/checks/step8",
+          "applicable": true,
+          "assertions": [
+            {
+              "id": "step8-goal-example-removal",
+              "text": "Obsolete or redundant information is absent: Delete the duplicated legacy checklist.",
+              "source_ref": "#/skills/0/requirements/removals/0"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "checks": {
+    "step1": {
+      "check": "changelog reverse check",
+      "inputs": {
+        "changelog": "run/changelog.json",
+        "baseline_root": "target/raw_skills",
+        "candidate_root": "target/to_be_improved_skills"
+      },
+      "applies_to": ["created", "updated", "deleted", "merge_source", "merge_target", "split_source", "split_target"],
+      "assertions": [
+        {
+          "id": "step1-hashes",
+          "text": "The before and after hashes match the baseline and candidate skill trees."
+        },
+        {
+          "id": "step1-claimed-changes",
+          "text": "Every changed section and directory is claimed by the active operation."
+        }
+      ]
+    },
+    "step2": {
+      "check": "goal align",
+      "inputs": {
+        "goal": "run/evolve-goal.json"
+      },
+      "applies_to": ["created", "updated", "deleted", "merge_source", "merge_target", "split_source", "split_target"],
+      "assertions": [
+        {
+          "id": "step2-unclaimed-changes",
+          "text": "No unclaimed section or directory changed."
+        }
+      ]
+    },
+    "step3": {
+      "check": "difficulty level check",
+      "evidence": {
+        "findings": [
+          {
+            "finding_id": "finding-example",
+            "path": "traces/derived/findings/finding-example/finding.json",
+            "candidate_source": "signal_detector",
+            "confidence": 0.9,
+            "evidence_records": 2,
+            "distinct_windows": 2,
+            "lesson": "The failure repeats when validation is omitted."
+          }
+        ]
+      },
+      "applies_to": ["created", "updated", "merge_target", "split_target"],
+      "assertions": [
+        {
+          "id": "step3-evidence-dependent",
+          "text": "The skill captures an evidence-dependent reusable procedure rather than baseline model knowledge."
+        },
+        {
+          "id": "step3-non-trivial",
+          "text": "The requested behavior is sufficiently non-trivial to justify skill instructions."
+        }
+      ]
+    },
+    "step4": {
+      "check": "not too complicated",
+      "thresholds": {
+        "min_methodology_value": 0.0
+      },
+      "applies_to": ["created", "updated", "merge_target", "split_target"],
+      "assertions": [
+        {
+          "id": "step4-minimal-procedure",
+          "text": "The candidate is the smallest procedure that satisfies the requirements."
+        },
+        {
+          "id": "step4-no-unnecessary-content",
+          "text": "The procedure does not add branches, files, or instructions that are unnecessary for the goal."
+        }
+      ]
+    },
+    "step5": {
+      "check": "checklist",
+      "from": "skills[].requirements",
+      "applies_to": ["created", "updated", "deleted", "merge_source", "merge_target", "split_source", "split_target"],
+      "assertions": [
+        {
+          "id": "step5-every-requirement",
+          "text": "Evaluate every applicable section, directory, removal, and avoid item; do not infer a pass from names or keyword presence."
+        },
+        {
+          "id": "step5-failure-evidence",
+          "text": "Record concrete evidence for each failed expectation."
+        }
+      ]
+    },
+    "step6": {
+      "check": "no degradation of existing capabilities or sections",
+      "inputs": {
+        "baseline_root": "target/raw_skills",
+        "candidate_root": "target/to_be_improved_skills"
+      },
+      "applies_to": ["updated", "merge_target", "split_target"],
+      "assertions": [
+        {
+          "id": "step6-capabilities-preserved",
+          "text": "Every pre-existing capability not explicitly replaced or removed by the goal remains available."
+        },
+        {
+          "id": "step6-valid-guidance-preserved",
+          "text": "Changed sections preserve still-valid constraints, recovery behavior, and verification guidance from the baseline."
+        }
+      ]
+    },
+    "step7": {
+      "check": "no overfitting",
+      "thresholds": {
+        "novelty_max_similarity": 0.0
+      },
+      "applies_to": ["created", "updated", "merge_target", "split_target"],
+      "assertions": [
+        {
+          "id": "step7-generalizes",
+          "text": "The candidate generalizes beyond the triggering trace, project, provider, filenames, and incidental values."
+        },
+        {
+          "id": "step7-no-eval-overfit",
+          "text": "The candidate does not duplicate another skill or optimize repeatedly against one evaluation case."
+        }
+      ]
+    },
+    "step8": {
+      "check": "unhelpful or redundant information removed",
+      "inputs": {
+        "baseline_root": "target/raw_skills",
+        "candidate_root": "target/to_be_improved_skills"
+      },
+      "applies_to": ["updated", "merge_target", "split_target"],
+      "assertions": [
+        {
+          "id": "step8-no-redundancy",
+          "text": "The candidate contains no duplicated, superseded, generic, or non-actionable instructions."
+        }
+      ]
+    }
+  }
+}

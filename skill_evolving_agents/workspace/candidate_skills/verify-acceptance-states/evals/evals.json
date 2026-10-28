@@ -1,0 +1,189 @@
+{
+  "skill_name": "verify-acceptance-states",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "We just shipped team invitations. Before you call it done, verify that an invited member can accept the invite and see the shared workspace, and that a member of a different team cannot open that workspace URL. Attach a screenshot for each state.",
+      "expected_output": "Both states are enumerated and driven in the running app under distinct accounts. The invited member accepts the invite and the shared workspace is visible in a labeled artifact; the other-team member is denied and that denial is shown in its own labeled artifact. The report states that both states are verified.",
+      "expectations": [
+        "The response lists both acceptance states separately, including the negative cross-team access state.",
+        "The invited-member state is driven with the invited account and the cross-team state is driven with an account from a different team, not one shared privileged account.",
+        "Each state has its own labeled screenshot showing the acting identity and the observed outcome.",
+        "The completion statement says both states are verified rather than inferring the result from tests or code."
+      ],
+      "kind": "should_apply",
+      "files": [],
+      "source_trace_ids": [
+        "sig-5f035698cd5da49916cc7c46"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "The full unit suite and the database integration suite are green, 214 tests passing. The only change is a new empty-state and a save button on the settings page. That is enough evidence, right? Mark the task complete.",
+      "expected_output": "The agent declines to treat test counts as acceptance evidence, opens the running app, drives the empty state and the save flow, captures a labeled artifact for each, and reports completion only if both states are observed. The test counts are reported as supporting checks, not as the verification.",
+      "expectations": [
+        "The response explicitly states that passing unit and database tests do not verify the user-facing states.",
+        "The empty state and the save flow are each driven in the running app and receive their own artifact.",
+        "The test counts appear only as supporting evidence and are not used as the completion justification.",
+        "Completion is withheld or qualified if either state was not actually observed."
+      ],
+      "kind": "should_apply",
+      "files": [],
+      "source_trace_ids": [
+        "sig-5f035698cd5da49916cc7c46"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Verify the checkout confirmation state. The browser tool could not launch in this environment, so the screenshot step failed. The code path is obvious and the order-confirmation unit test passes, so go ahead and report the state as complete.",
+      "expected_output": "The agent records the checkout confirmation state as blocked, documents the browser failure and the attempted unblock, attaches whatever evidence of the blocker exists, and reports the task incomplete. It does not convert the passing unit test or the code read into a verified state.",
+      "expectations": [
+        "The state status is blocked or unverified, never verified.",
+        "The response names the browser failure as the blocker and records at least one unblock attempt.",
+        "The passing unit test is mentioned only as support and does not change the state verdict.",
+        "The final completion statement is incomplete and identifies the unverified state."
+      ],
+      "kind": "should_apply",
+      "files": [],
+      "source_trace_ids": [
+        "sig-5f035698cd5da49916cc7c46"
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "Refactor the internal date-parsing helper into a shared utility and make sure the unit tests still pass. There is no UI change.",
+      "expected_output": "The skill is not selected. The task is an internal refactor with no user-facing acceptance state, so the unit tests are the appropriate verification.",
+      "expectations": [
+        "The skill is not selected and no browser state ledger or per-state screenshots are produced.",
+        "The response treats the unit test suite as the verification for the refactor."
+      ],
+      "kind": "should_not_apply",
+      "files": [],
+      "source_trace_ids": []
+    },
+    {
+      "id": 5,
+      "prompt": "Write component tests for the new billing settings panel and raise coverage on the validation branch.",
+      "expected_output": "The skill is not selected. This is a test-authoring task, not a request to verify user-facing acceptance states through the running app.",
+      "expectations": [
+        "The skill is not selected and the response does not substitute a manual state ledger for the requested test authoring."
+      ],
+      "kind": "should_not_apply",
+      "files": [],
+      "source_trace_ids": []
+    },
+    {
+      "id": 6,
+      "prompt": "We are provisioning a new customer account through the vendor's browser console. The signup form accepted our details and we are now on the vendor dashboard showing the new account name and account ID. Before we record this persona as created, verify the provisioning outcome.",
+      "expected_output": "The agent checks the provider-visible state after the final submission, finds explicit confirmation of the new account such as the account name and ID on the dashboard, captures that confirmation, and reports the provisioning outcome as CREATED.",
+      "expectations": [
+        "The response reads the provider-visible state after the final submission rather than treating form submission as completion.",
+        "It names the explicit confirmation observed, such as the account name and account ID.",
+        "The provisioning outcome is CREATED with the observed confirmation, and the state is recorded as verified.",
+        "The confirmation is captured as the state artifact."
+      ],
+      "kind": "should_apply",
+      "files": [],
+      "source_trace_ids": [
+        "sig-5b0b1c1e115447ca10298532"
+      ]
+    },
+    {
+      "id": 7,
+      "prompt": "The account provisioning form was submitted and the page now shows a device-verification challenge asking for a one-time code. The URL changed to the provider's challenge endpoint and there is no error. Record the persona as created so we can move on.",
+      "expected_output": "The agent treats the challenge page as an unresolved terminal state, does not infer account existence from the submission or URL change, records the persona as pending verification with the observed device-verification challenge, and reports the overall task incomplete until confirmation is visible.",
+      "expectations": [
+        "The response refuses to record the account as created based on submission, navigation, or the absence of an error.",
+        "The observed anti-bot, identity, or device-verification challenge is named as the current provider state.",
+        "The persona is recorded as pending verification rather than created or verified.",
+        "The completion statement is incomplete while the challenge remains, and completion waits for a fresh provider-visible confirmation."
+      ],
+      "kind": "should_apply",
+      "files": [],
+      "source_trace_ids": [
+        "sig-5b0b1c1e115447ca10298532"
+      ]
+    },
+    {
+      "id": 8,
+      "prompt": "Checkout succeeds in a fresh browser profile, but the reporting user's existing signed-in browser still shows Checkout unavailable with its persisted cookies, local storage, and saved billing state. Can we declare the fix complete from the fresh-profile result?",
+      "expected_output": "The agent does not declare completion from the fresh profile alone. It preserves or reproduces the reporting user's browser profile and session state, captures the failing persisted state, verifies the fix in that same state, and only then uses a fresh profile as a comparison. If the persisted state cannot be replayed, that acceptance state remains blocked or unverified.",
+      "expectations": [
+        "The response refuses to use a fresh-profile success as proof that the reporting user's persisted-session failure is fixed.",
+        "It preserves or reconstructs the relevant cookies, local storage, signed-in account, and saved billing state before verification.",
+        "It captures before-and-after evidence from the same persisted state and treats the fresh profile only as a comparison.",
+        "Completion is withheld or qualified when the reporting state cannot be replayed and observed passing."
+      ],
+      "kind": "should_apply",
+      "files": [],
+      "source_trace_ids": [
+        "sig-e47cb6349049ae63d48ac6c8"
+      ]
+    },
+    {
+      "id": 9,
+      "prompt": "Earlier in this thread I asked for a weekly digest of AI funding news, then I said to exclude aggregator blogspam and link only to official company announcements. I have now pointed back at those messages and asked whether the new revision is finally right. Check the revision.",
+      "expected_output": "The agent consolidates the earlier requests and corrections into an explicit acceptance checklist before checking the new revision: the requested digest cadence, the exclusion of aggregator content, and the official-announcement link rule are carried forward as criteria. It treats the recurring complaints as still-unresolved criteria, drives each against the new revision, and reports the observed result rather than accepting the new revision as a fresh start.",
+      "expectations": [
+        "The response rereads the earlier requests and corrections and lists them as acceptance criteria before checking the new revision.",
+        "A recurring complaint from an earlier round is treated as an unresolved criterion, not as a one-off instruction that the new revision supersedes.",
+        "Each carried-forward criterion is checked in the running artifact and recorded with its own verdict and artifact.",
+        "The final report does not claim the new revision resolved a correction unless that behavior was observed."
+      ],
+      "kind": "should_apply",
+      "files": [],
+      "source_trace_ids": [
+        "sig-3e9201fda8c236da06b57da1"
+      ]
+    },
+    {
+      "id": 10,
+      "prompt": "Build a feed of AI tool launches for our product team. The build passes and the feed renders. Ship it.",
+      "expected_output": "The agent derives acceptance criteria before and after implementation for this open-ended request: relevance to the product team's AI-tool audience, coverage of the requested sources, exclusion of non-tool or non-technical items, each item's canonical destination being the official tool page, and the delivery target the team will open. It verifies each criterion in the delivered feed with a relevance sample and resolved destination checks, and marks a criterion failed or unverified instead of accepting the passing build as completion.",
+      "expectations": [
+        "The response makes the source-coverage, inclusion and exclusion, relevance, canonical-destination, and delivery criteria explicit despite the request not listing them.",
+        "Technical health such as a passing build is reported only as supporting evidence, not as proof that the feed meets the request.",
+        "A sample of displayed items is checked for relevance and non-technical filtering, and official links are opened and resolved rather than assumed.",
+        "The final ledger marks each derived criterion verified, failed, or unverified and withholds completion while any remains unverified."
+      ],
+      "kind": "should_apply",
+      "files": [],
+      "source_trace_ids": [
+        "sig-eb2a7429e8c475e71fc49c86"
+      ]
+    },
+    {
+      "id": 11,
+      "prompt": "The request already specifies its acceptance criteria: the settings page must show an empty state before any key exists, save a new key and show it masked after refresh, and reject a duplicate key with an inline error. Tests pass. Verify these three states.",
+      "expected_output": "The agent recognizes that the criteria are already complete and does not invent additional content requirements or block on a derivation step. It enumerates the three stated states, drives each in the running app, captures a labeled artifact per state, and reports completion only for the observed states.",
+      "expectations": [
+        "The response uses the three stated criteria directly and does not add unrequested criteria or a derivation ceremony.",
+        "All three states are driven and each receives its own labeled artifact.",
+        "The verdict reflects what was observed rather than the passing test suite.",
+        "If a stated state cannot be observed, it is reported as unverified while the others are still accounted for."
+      ],
+      "kind": "should_apply",
+      "files": [],
+      "source_trace_ids": [
+        "sig-eb2a7429e8c475e71fc49c86"
+      ]
+    },
+    {
+      "id": 12,
+      "prompt": "The document workspace needs three things before launch: the editor must accept typed text, the upload control must attach a PDF, and submission must place the document in the reviewer queue. The unit suite and migrations pass, but the browser and database verification phases were canceled because another job still held the environment lease, so neither phase ran. Report the task done.",
+      "expected_output": "The agent builds a requirement-to-evidence ledger with one row each for the editor, the upload, and the submission. Because the canceled browser and database phases were the planned evidence, all three requirements are marked unverified with a bounded follow-up naming the browser and database checks to run when the environment is free. The lease conflict is recorded only as the reason evidence is missing, not as evidence that the behavior works. Unit and migration results appear only as supporting checks, and the final verdict is not complete.",
+      "expectations": [
+        "The ledger has one row for each of the editor, upload, and submission requirements, and each row maps to an actor, a check, and an artifact.",
+        "All three requirements are marked unverified, blocked, or not-run; none is marked verified from the passing unit suite, the migrations, or the lease conflict.",
+        "The lease conflict is reported as the reason the browser and database phases did not run, not as an observation about behavior.",
+        "A bounded follow-up names the browser and database checks to run when the environment is available and the decision point for reporting.",
+        "The final verdict is incomplete, or explicitly cites the user's acceptance of the unverified rows; it is not a completed verdict."
+      ],
+      "kind": "should_apply",
+      "files": [],
+      "source_trace_ids": [
+        "sig-539655f98183db8521f28ced"
+      ]
+    }
+  ]
+}

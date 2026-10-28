@@ -1,0 +1,10617 @@
+#!/usr/bin/env python3
+"""Run isolated skill-evolving sessions with deterministic stage reducers."""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import glob
+import hashlib
+import importlib.util
+import json
+import os
+import re
+import signal
+import shlex
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from datetime import UTC, datetime
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+INSTALL_ROOT = ROOT
+REPO = ROOT.parent
+
+
+def load_project_env(path: Path) -> None:
+    """Load a simple dotenv file without overriding the process environment."""
+    if not path.is_file():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        key, separator, value = line.partition("=")
+        key = key.strip()
+        if not separator or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
+
+
+load_project_env(REPO / ".env")
+
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from core.phase_envelope import artifact_ref, build_envelope, write_envelope
+from core.profile import ProfileError, resolve_profile
+from core.config_metrics import summarize_phase_envelopes
+from core.online_learning import StudyStore
+from core.state_machine import StateMachineRuntime, TransitionDecision, load_machine
+from core.super_config import SuperConfigError, load_super_config, resolve_execution_config
+from core.service_tiers import ServiceTierError, load_service_tiers
+from core.optimization import load_spec, validate_knob_registry
+from common import inventory_store, privacy, release_bundle, replay_runner, skill_resources
+from policy import FixedPolicy, PolicyCompiler, PolicyStore, extract_policy_features
+from services.embedding_api.client import EmbeddingClient, EmbeddingServiceError
+from services.embedding_api.provider import EmbeddingProvider, validate_embedding_runtime
+
+CONFIG_PATH = ROOT / "common/preprocessing-config.json"
+AGENT_CONFIG_PATH = ROOT / "common/agent-config.json"
+VERIFICATION_INPUT_TEMPLATE = (
+    ROOT
+    / "05_verifiter_agent"
+    / "verifiter"
+    / "verification-input.template.json"
+)
+KNOWN_BACKENDS = (
+    "cursor",
+    "claude",
+    "codex",
+    "dsh",
+    "hermes",
+    "openclaw",
+    "docker-claude",
+)
+CONTAINER_WORKSPACE = "/opt/skill-evolver/skill_evolving_agents/workspace"
+SESSION_ROOT = Path(
+    os.environ.get("SKILL_EVOLVER_SESSION_ROOT", "")
+    or Path(tempfile.gettempdir()) / "skill-evolver-sessions"
+)
+SKILL_CHANGELOG_DIR = Path("target/skill_changelogs")
+COMPLETE_SKILL_TEMPLATE = (
+    ROOT / "04_optimize_agent/skill-create/templates/complete-skill"
+)
+OPTIMIZE_TEMPLATE_DIR = Path("_templates/complete-skill")
+POOL_CHANGELOG_DIR = Path("candidate_skills_changelog")
+CHANGELOG_SUMMARY_LIMIT = 120
+DEFAULT_CLUSTER_WORKERS = 16
+DEFAULT_OP_WORKERS = 16
+RETRY_BUDGET = 0
+VERIFIER_RESPONSE_RETRY_BUDGET = 2
+AGENT_SESSION_TIMEOUT_SECONDS = int(
+    os.environ.get("SKILL_EVOLVER_AGENT_TIMEOUT_SECONDS", "180")
+)
+# One skill's checks and scored JSON were still being written at 180 seconds.
+VERIFIER_SESSION_TIMEOUT_SECONDS = int(
+    os.environ.get("SKILL_EVOLVER_VERIFIER_TIMEOUT_SECONDS", "360")
+)
+_EXECUTION_LOG_LOCK = threading.Lock()
+_AGENT_BUDGET_LOCK = threading.Lock()
+_STATUS_LOCK = threading.Lock()
+_AGENT_CALL_COUNTS: dict[str, int] = {}
+ACTIVE_BACKEND = "docker-claude"
+ACTIVE_EXECUTION_CONFIG: dict = {}
+ACTIVE_EMBEDDING_PROVIDER: EmbeddingProvider | None = None
+ACTIVE_RUN_DEADLINE_MONOTONIC: float | None = None
+ACTIVE_INVENTORY_ROOT = ROOT / "workspace"
+
+
+def active_inventory_root() -> Path:
+    """Honor test/install root replacement while preserving tenant selection."""
+    if ACTIVE_INVENTORY_ROOT == INSTALL_ROOT / "workspace":
+        return ROOT / "workspace"
+    return ACTIVE_INVENTORY_ROOT
+
+
+def compile_runtime_policy(
+    workspace: Path,
+    run_id: str,
+    deployment_profile: dict,
+    execution_config: dict,
+) -> tuple[dict, dict]:
+    """Route fixed config through the same boundary future policies will use."""
+    registry = validate_knob_registry(
+        load_spec(INSTALL_ROOT / "config/knob-registry.json", "knob registry")
+    )
+    base_documents = {
+        "profile": deployment_profile,
+        "preprocessing": json.loads(
+            (INSTALL_ROOT / "common/preprocessing-config.json").read_text()
+        ),
+        "recall": json.loads((INSTALL_ROOT / "common/recall-config.json").read_text()),
+        "super_config": json.loads(
+            (INSTALL_ROOT / "config/super-config.json").read_text()
+        ),
+    }
+    features = extract_policy_features(
+        workspace,
+        run_id=run_id,
+        profile=deployment_profile,
+        execution_config=execution_config,
+    )
+    decision = FixedPolicy(registry).decide(features, base_documents)
+    compiled = PolicyCompiler(registry).compile(decision, base_documents)
+    policy_root = workspace / "run/config/policy"
+    atomic_write_json(policy_root / "features.json", features)
+    atomic_write_json(policy_root / "decision.json", decision)
+    atomic_write_json(policy_root / "compiled.json", compiled)
+    store = PolicyStore(workspace.parents[1] / "optimization.sqlite")
+    store.record_features(features)
+    store.record_decision(decision)
+    if compiled["status"] != "valid":
+        raise SystemExit(
+            "runtime policy compilation failed: " + "; ".join(compiled["errors"])
+        )
+    return compiled["documents"]["profile"], compiled
+
+
+class AgentCallBudgetExceeded(RuntimeError):
+    pass
+
+
+def reserve_agent_call(workspace: Path, stage: str, suffix: str) -> None:
+    """Atomically enforce the configured hard agent-session cap."""
+    budget = ACTIVE_EXECUTION_CONFIG.get("budgets") or {}
+    cap = budget.get("hard_agent_call_cap")
+    if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
+        return
+    authoritative = metrics_workspace(workspace).resolve()
+    key = str(authoritative)
+    with _AGENT_BUDGET_LOCK:
+        if key not in _AGENT_CALL_COUNTS:
+            previous = authoritative / "logs/agent-call-budget.json"
+            try:
+                prior = json.loads(previous.read_text()) if previous.is_file() else {}
+                _AGENT_CALL_COUNTS[key] = int(prior.get("used", 0))
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                _AGENT_CALL_COUNTS[key] = 0
+        used = _AGENT_CALL_COUNTS[key]
+        if used >= cap:
+            raise AgentCallBudgetExceeded(
+                f"agent call cap {cap} reached before {stage}/{suffix}; "
+                f"policy={budget.get('on_cap', 'fail')}"
+            )
+        used += 1
+        _AGENT_CALL_COUNTS[key] = used
+        atomic_write_json(
+            authoritative / "logs/agent-call-budget.json",
+            {
+                "schema_version": 1,
+                "used": used,
+                "hard_cap": cap,
+                "remaining": cap - used,
+                "target": budget.get("target_agent_calls"),
+                "on_cap": budget.get("on_cap", "fail"),
+                "last_stage": stage,
+                "last_item": suffix,
+            },
+        )
+AGENT_NUMBERS = {
+    "preprocessing": "01",
+    "label-skills": "02.1",
+    "label-traces-cluster": "02.2",
+    "goal": "03",
+    "optimize": "04",
+    "verifiter": "05",
+    "judge": "06",
+}
+
+
+_CONTRACTS_PATH = ROOT / "common/pipeline_contracts.py"
+_CONTRACTS_SPEC = importlib.util.spec_from_file_location(
+    "pipeline_contracts", _CONTRACTS_PATH
+)
+pipeline_contracts = importlib.util.module_from_spec(_CONTRACTS_SPEC)
+assert _CONTRACTS_SPEC.loader is not None
+_CONTRACTS_SPEC.loader.exec_module(pipeline_contracts)
+_METRICS_PATH = ROOT / "common/pipeline_metrics.py"
+_METRICS_SPEC = importlib.util.spec_from_file_location(
+    "pipeline_metrics", _METRICS_PATH
+)
+pipeline_metrics = importlib.util.module_from_spec(_METRICS_SPEC)
+assert _METRICS_SPEC.loader is not None
+_METRICS_SPEC.loader.exec_module(pipeline_metrics)
+_NAMES_PATH = ROOT / "common/skill_names.py"
+_NAMES_SPEC = importlib.util.spec_from_file_location("skill_names", _NAMES_PATH)
+skill_names_mod = importlib.util.module_from_spec(_NAMES_SPEC)
+assert _NAMES_SPEC.loader is not None
+_NAMES_SPEC.loader.exec_module(skill_names_mod)
+_RECALL_PATH = ROOT / "03_goal_agent/skill-select/recall_skills.py"
+_RECALL_SPEC = importlib.util.spec_from_file_location(
+    "pipeline_recall_skills", _RECALL_PATH
+)
+recall_skills_mod = importlib.util.module_from_spec(_RECALL_SPEC)
+assert _RECALL_SPEC.loader is not None
+_RECALL_SPEC.loader.exec_module(recall_skills_mod)
+_VERIFICATION_BUILDER_PATH = (
+    ROOT
+    / "05_verifiter_agent"
+    / "verifiter"
+    / "verification_from_goal.py"
+)
+sys.path.insert(0, str(_VERIFICATION_BUILDER_PATH.parent))
+_VERIFICATION_BUILDER_SPEC = importlib.util.spec_from_file_location(
+    "verification_from_goal_runtime", _VERIFICATION_BUILDER_PATH
+)
+verification_builder = importlib.util.module_from_spec(
+    _VERIFICATION_BUILDER_SPEC
+)
+assert _VERIFICATION_BUILDER_SPEC.loader is not None
+_VERIFICATION_BUILDER_SPEC.loader.exec_module(verification_builder)
+_FORMAT_PATH = ROOT / "common/skill_format_checker.py"
+_FORMAT_SPEC = importlib.util.spec_from_file_location(
+    "skill_format_checker", _FORMAT_PATH
+)
+skill_format_checker = importlib.util.module_from_spec(_FORMAT_SPEC)
+assert _FORMAT_SPEC.loader is not None
+_FORMAT_SPEC.loader.exec_module(skill_format_checker)
+_EVALUATION_PATH = ROOT / "common/skill_evaluation.py"
+_EVALUATION_SPEC = importlib.util.spec_from_file_location(
+    "skill_evaluation", _EVALUATION_PATH
+)
+skill_evaluation = importlib.util.module_from_spec(_EVALUATION_SPEC)
+assert _EVALUATION_SPEC.loader is not None
+_EVALUATION_SPEC.loader.exec_module(skill_evaluation)
+_NORMALIZER_PATH = ROOT / "01_preprocessing_agent/scripts/normalize_codex.py"
+_NORMALIZER_SPEC = importlib.util.spec_from_file_location(
+    "normalize_codex", _NORMALIZER_PATH
+)
+normalizer = importlib.util.module_from_spec(_NORMALIZER_SPEC)
+assert _NORMALIZER_SPEC.loader is not None
+_NORMALIZER_SPEC.loader.exec_module(normalizer)
+_CLUSTER_PATH = ROOT / "01_preprocessing_agent/scripts/cluster_traces.py"
+_CLUSTER_SPEC = importlib.util.spec_from_file_location(
+    "cluster_traces", _CLUSTER_PATH
+)
+cluster_builder = importlib.util.module_from_spec(_CLUSTER_SPEC)
+assert _CLUSTER_SPEC.loader is not None
+_CLUSTER_SPEC.loader.exec_module(cluster_builder)
+_PREPROCESSING_ROOT = ROOT / "01_preprocessing_agent"
+if str(_PREPROCESSING_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PREPROCESSING_ROOT))
+from trace_mining import engine as mining_engine
+mining_engine.normalizer = normalizer
+mining_engine.cluster_builder = cluster_builder
+
+AGENT_RUNTIME_IMAGE = "skill-evolver-agent-runtime"
+
+SKILLS = {
+    "preprocessing": ["01_preprocessing_agent/cut-traces/skill.md"],
+    "label-skills": ["02.1_label_skills_agent/existing_skills_labeler/skill.md"],
+    "label-traces-cluster": [
+        "02.2_label_traces_cluster_agent/dignosis/skill.md"
+    ],
+    "goal": [
+        "03_goal_agent/skill-select/skill.md",
+        "03_goal_agent/goal-generator/skill.md",
+    ],
+    "optimize": [
+        "04_optimize_agent/skill-create/skill.md",
+        "04_optimize_agent/skill-edit/skill.md",
+        "04_optimize_agent/ood-data-updater/skill.md",
+    ],
+    "verifiter": ["05_verifiter_agent/verifiter/skill.md"],
+    "judge": ["06_judge_agent/judge/skill.md"],
+}
+
+AGENT_FILES = {
+    "preprocessing": "01_preprocessing_agent/preprocessing_agent.md",
+    "label-skills": "02.1_label_skills_agent/label_skills_agent.md",
+    "label-traces-cluster": (
+        "02.2_label_traces_cluster_agent/label_traces_cluster_agent.md"
+    ),
+    "goal": "03_goal_agent/goal_agent.md",
+    "optimize": "04_optimize_agent/optimize_agent.md",
+    "verifiter": "05_verifiter_agent/verifiter_agent.md",
+    "judge": "06_judge_agent/judge_agent.md",
+}
+
+STAGE_DIRS = {
+    "preprocessing": "01_preprocessing_agent",
+    "label-skills": "02.1_label_skills_agent",
+    "label-traces-cluster": "02.2_label_traces_cluster_agent",
+    "goal": "03_goal_agent",
+    "optimize": "04_optimize_agent",
+    "verifiter": "05_verifiter_agent",
+    "judge": "06_judge_agent",
+}
+
+
+def run_semantic_prefilter_observer(
+    workspace: Path, run_id: str, profile: dict
+) -> None:
+    """Run the optional semantic filter without changing production routing."""
+    config = profile["phases"]["semantic_prefilter"]
+    if config["mode"] in {"disabled", "passthrough"}:
+        return
+    if config["mode"] not in {"observe", "enabled"}:
+        raise SystemExit("unsupported semantic-prefilter mode")
+    findings_root = workspace / "traces/derived/findings"
+    finding_paths = sorted(findings_root.glob("*/finding.json"))
+    if not finding_paths:
+        return
+    started = datetime.now(UTC)
+    status_path = workspace / "run/status/semantic-prefilter/all.json"
+    implementation = {
+        "kind": "embedding-service",
+        "name": str(config.get("algorithm", "semantic-prefilter")),
+        "version": "1",
+        "config_digest": profile["config_digest"],
+        "service": "shared-embedding",
+        "cost_tier": 1,
+    }
+    try:
+        findings = [json.loads(path.read_text()) for path in finding_paths]
+        input_max_chars = int(config.get("input_max_chars", 2400))
+        if input_max_chars < 256:
+            raise ValueError(
+                "semantic prefilter input_max_chars must be at least 256"
+            )
+        texts = [
+            json.dumps(value, ensure_ascii=False, sort_keys=True)[:input_max_chars]
+            for value in findings
+        ]
+        provider = ACTIVE_EMBEDDING_PROVIDER or EmbeddingProvider(
+            config, INSTALL_ROOT / "services/embedding_api/server.py"
+        )
+        response = provider.classify(
+            texts, dict(config["categories"]), top_k=int(config.get("top_k", 3))
+        )
+        rows = []
+        for path, result in zip(finding_paths, response["results"]):
+            matches = result.get("matches") or []
+            decision = semantic_category_decision(matches, config)
+            rows.append(
+                {
+                    "finding": path.parent.name,
+                    **decision,
+                    "matches": matches,
+                }
+            )
+        output = workspace / "traces/derived/semantic-prefilter-shadow.json"
+        atomic_write_json(
+            output,
+            {
+                "mode": config["mode"],
+                "model": response["model"],
+                "model_revision": response["model_revision"],
+                "index_revision": response.get("index_revision"),
+                "rows": rows,
+            },
+        )
+        envelope = build_envelope(
+            run_id=run_id,
+            phase="semantic-prefilter",
+            item_id="all",
+            implementation=implementation,
+            status="completed",
+            started_at=started.isoformat(),
+            input_refs=[artifact_ref(path, relative_to=workspace) for path in finding_paths],
+            output_ref=artifact_ref(output, relative_to=workspace),
+            decision={
+                "disposition": "observed" if config["mode"] == "observe" else "applied",
+                "mode": config["mode"],
+                "reason_codes": [config["mode"]],
+            },
+            measurements={
+                "wall_ms": round(
+                    (datetime.now(UTC) - started).total_seconds() * 1000,
+                    3,
+                ),
+                "input_count": len(finding_paths),
+                "input_max_chars": input_max_chars,
+                "service_ms": response.get("service_ms"),
+            },
+        )
+    except (KeyError, ValueError, OSError, json.JSONDecodeError, EmbeddingServiceError) as error:
+        envelope = build_envelope(
+            run_id=run_id,
+            phase="semantic-prefilter",
+            item_id="all",
+            implementation=implementation,
+            status="failed",
+            started_at=started.isoformat(),
+            input_refs=[artifact_ref(path, relative_to=workspace) for path in finding_paths],
+            decision={
+                "disposition": str(config.get("on_error", "escalate")),
+                "mode": config["mode"],
+                "reason_codes": ["service_error"],
+            },
+            measurements={
+                "wall_ms": round(
+                    (datetime.now(UTC) - started).total_seconds() * 1000,
+                    3,
+                ),
+                "input_count": len(finding_paths),
+            },
+            error={"type": type(error).__name__, "message": str(error)},
+        )
+    write_envelope(status_path, envelope)
+
+
+def semantic_category_decision(matches: list[dict], config: dict) -> dict:
+    """Make a conservative category decision from embedding similarities.
+
+    A low similarity is uncertainty, not proof that a finding is irrelevant.
+    Rejection is allowed only when the explicit noise category wins strongly
+    and by a sufficient margin. This keeps the cheap tier fail-open.
+    """
+    if not matches:
+        return {
+            "disposition": "escalate",
+            "reason_code": "no_embedding_match",
+            "top_category": None,
+            "top_score": None,
+            "score_margin": None,
+        }
+    top = matches[0]
+    category = str(top.get("id") or "")
+    score = float(top.get("score", -1.0))
+    runner_up = float(matches[1].get("score", -1.0)) if len(matches) > 1 else -1.0
+    margin = score - runner_up
+    min_margin = float(config.get("minimum_margin", 0.08))
+    accept_at = float(config["accept_at"])
+    noise_accept_at = float(config.get("noise_accept_at", accept_at))
+    decisive = margin >= min_margin
+    if category == "noise" and score >= noise_accept_at and decisive:
+        disposition, reason = "rejected", "confident_noise"
+    elif category != "noise" and score >= accept_at and decisive:
+        disposition, reason = "selected", "confident_relevant_category"
+    else:
+        disposition, reason = "escalate", "uncertain_category"
+    return {
+        "disposition": disposition,
+        "reason_code": reason,
+        "top_category": category or None,
+        "top_score": round(score, 6),
+        "score_margin": round(margin, 6),
+    }
+
+
+def low_cost_allowed_scopes(
+    workspace: Path, scopes: list[str], profile: dict
+) -> list[str]:
+    """Defer weak findings while allowing recurrence to mature across runs."""
+    gate = profile.get("evolution_gate")
+    if not isinstance(gate, dict) or not gate.get("enabled"):
+        return scopes
+    shadow_path = workspace / "traces/derived/semantic-prefilter-shadow.json"
+    shadow: dict[str, str] = {}
+    if shadow_path.is_file():
+        try:
+            shadow = {
+                str(row["finding"]): str(row["disposition"])
+                for row in json.loads(shadow_path.read_text()).get("rows", [])
+            }
+        except (KeyError, TypeError, json.JSONDecodeError):
+            shadow = {}
+    allowed: list[str] = []
+    decisions = []
+    immediate = set(gate.get("immediate_detectors") or [])
+    metrics_database = workspace.parents[1] / "metrics.sqlite"
+    with sqlite3.connect(metrics_database, timeout=30) as connection:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS finding_recurrence_observations ("
+            "run_id TEXT NOT NULL, scope TEXT NOT NULL, detector TEXT NOT NULL, "
+            "session_id TEXT NOT NULL, evidence_records INTEGER NOT NULL, "
+            "confidence REAL NOT NULL, severity TEXT NOT NULL, "
+            "observed_at TEXT NOT NULL, "
+            "PRIMARY KEY (run_id, scope, session_id))"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS finding_recurrence_detector_session "
+            "ON finding_recurrence_observations(detector, session_id)"
+        )
+    for scope in scopes:
+        path = workspace / "traces/derived/findings" / scope / "finding.json"
+        if not path.is_file():
+            allowed.append(scope)
+            continue
+        finding = json.loads(path.read_text())
+        current_sessions = {
+            str(trace).split(":", 2)[1]
+            for trace in finding.get("trace_ids") or []
+            if isinstance(trace, str) and ":" in trace
+        }
+        current_evidence_count = len(finding.get("evidence") or [])
+        confidence = float(finding.get("confidence") or 0)
+        detector = str(finding.get("detector") or "")
+        features = finding.get("features") or {}
+        recurrence_key = detector
+        if features.get("candidate_source") == "resource_opportunity":
+            recurrence_key = ":".join(
+                value
+                for value in (
+                    detector,
+                    str(features.get("resource_family") or ""),
+                    str(features.get("resource_fingerprint") or ""),
+                )
+                if value
+            )
+        severity = str(finding.get("severity") or "")
+        observed_at = datetime.now(UTC).isoformat()
+        with sqlite3.connect(metrics_database, timeout=30) as connection:
+            for session_id in current_sessions:
+                connection.execute(
+                    "INSERT OR REPLACE INTO finding_recurrence_observations "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        workspace.name,
+                        scope,
+                        recurrence_key,
+                        session_id,
+                        current_evidence_count,
+                        confidence,
+                        severity,
+                        observed_at,
+                    ),
+                )
+            prior = connection.execute(
+                "SELECT session_id, MAX(evidence_records), MAX(confidence) "
+                "FROM finding_recurrence_observations WHERE detector = ? "
+                "GROUP BY session_id",
+                (recurrence_key,),
+            ).fetchall()
+        sessions = {str(row[0]) for row in prior}
+        evidence_count = sum(int(row[1]) for row in prior)
+        historical_sessions = len(sessions - current_sessions)
+        semantic = shadow.get(scope, "escalate")
+        reasons = []
+        keep = False
+        protected = False
+        if severity == "critical" and gate.get("immediate_critical", True):
+            keep, protected, reasons = True, True, ["critical"]
+        elif detector in immediate:
+            keep, protected, reasons = True, True, ["immediate_detector"]
+        elif (
+            features.get("candidate_source") == "resource_opportunity"
+            and features.get("resource_evidence_mode") == "authored_lifecycle"
+            and int(features.get("distinct_lifecycle_stages") or 0) >= 3
+            and confidence >= 0.9
+            and {
+                "repeated-independent-invocations",
+                "explicit-resource-shape",
+                "stable-normalized-fingerprint",
+                "successful-post-authoring-validation",
+            }
+            <= {
+                str(item)
+                for item in (features.get("false_positive_guards") or [])
+                if isinstance(item, str)
+            }
+        ):
+            keep, protected, reasons = (
+                True,
+                True,
+                ["qualified_authored_resource_lifecycle"],
+            )
+        elif len(sessions) >= int(gate.get("minimum_distinct_sessions", 2)):
+            keep, reasons = True, ["recurring_sessions"]
+        elif (
+            evidence_count >= int(gate.get("minimum_evidence_records", 3))
+            and confidence >= float(gate.get("minimum_confidence", 0.8))
+        ):
+            keep, reasons = True, ["strong_evidence"]
+        if semantic == "rejected" and not protected:
+            keep, reasons = False, ["semantic_reject"]
+        if keep:
+            allowed.append(scope)
+        decisions.append(
+            {
+                "scope": scope,
+                "disposition": "selected" if keep else "deferred",
+                "reason_codes": reasons or ["insufficient_recurrence"],
+                "distinct_sessions": len(sessions),
+                "evidence_records": evidence_count,
+                "current_session_count": len(current_sessions),
+                "current_evidence_records": current_evidence_count,
+                "historical_sessions": historical_sessions,
+                "recurrence_key": recurrence_key,
+                "confidence": confidence,
+                "semantic_disposition": semantic,
+            }
+        )
+    atomic_write_json(
+        workspace / "traces/derived/evolution-gate.json",
+        {"schema_version": 1, "decisions": decisions},
+    )
+    return allowed
+
+
+def lexical_inventory_fallback(
+    diagnosis: dict[str, object],
+    finding: dict[str, object],
+    metadata: dict[str, object],
+    skills_root: Path,
+    *,
+    min_score: float = 0.08,
+    limit: int = 3,
+) -> list[dict[str, object]]:
+    """Recall existing skills when an OOD label has no taxonomy match.
+
+    The query intentionally uses diagnosis and generalized lesson text, not raw
+    tool transcripts. This is a collision guard before create, not a semantic
+    claim that the taxonomy label exists.
+    """
+    query_parts: list[str] = []
+    for key in (
+        "skill_capabilities_missing",
+        "newly_detected_skill_capabilites_missing",
+    ):
+        for row in diagnosis.get(key) or []:
+            if not isinstance(row, dict):
+                continue
+            query_parts.extend(
+                str(row.get(field) or "")
+                for field in ("type", "description", "reasoning")
+            )
+    features = finding.get("features") if isinstance(finding, dict) else {}
+    lesson = features.get("lesson") if isinstance(features, dict) else {}
+    if isinstance(lesson, dict):
+        query_parts.extend(
+            str(lesson.get(field) or "")
+            for field in ("kind", "rule", "decision_rule", "failure_guard")
+        )
+    stop = {
+        "the", "and", "for", "this", "that", "with", "when", "from",
+        "skill", "capability", "agent", "methodology", "workflow",
+    }
+
+    def tokens(value: str) -> set[str]:
+        return {
+            token
+            for token in re.findall(r"[a-z][a-z0-9_-]{2,}", value.lower())
+            if token not in stop
+        }
+
+    query = tokens(" ".join(query_parts))
+    if not query:
+        return []
+    rows = {
+        str(row.get("skill")): row
+        for row in metadata.get("skills_metadata") or []
+        if isinstance(row, dict) and row.get("skill")
+    }
+    ranked: list[tuple[float, str, dict[str, object]]] = []
+    for name, row in rows.items():
+        path = skills_root / name / "SKILL.md"
+        if not path.is_file():
+            continue
+        document = tokens(path.read_text())
+        if not document:
+            continue
+        overlap = query & document
+        score = len(overlap) / len(query)
+        if score >= min_score:
+            ranked.append((score, name, row))
+    result = []
+    for score, name, row in sorted(ranked, key=lambda item: (-item[0], item[1]))[:limit]:
+        result.append(
+            {
+                "skill": name,
+                "score": round(score, 6),
+                "labels": copy.deepcopy(row.get("skill_types") or []),
+                "matches": [
+                    {
+                        "cluster_type": "lexical/query",
+                        "skill_type": "lexical/skill",
+                        "similarity": round(score, 6),
+                        "contribution": round(score, 6),
+                    }
+                ],
+                "fallback_reason": "ood_lexical_collision_guard",
+            }
+        )
+    return result
+
+
+def previously_applied_finding_skills(
+    workspace: Path,
+    finding_id: str,
+    recalled: list[dict] | None,
+    finding: dict[str, object] | None = None,
+) -> list[str]:
+    """Return current skills already changed for this exact finding.
+
+    Exact-finding idempotency is an inventory invariant, not a retrieval
+    heuristic. Recall can legitimately change with model, threshold, or skill
+    content updates, so restricting this scan to recalled skills can apply the
+    same evidence twice.
+    """
+    if not finding_id:
+        return []
+    operation = re.compile(
+        rf"^- \d{{4}}-\d{{2}}-\d{{2}} "
+        rf"(?:create|update|merge|split) {re.escape(finding_id)}/\d+\b",
+        re.MULTILINE,
+    )
+    changelog_root = workspace / SKILL_CHANGELOG_DIR
+    if not changelog_root.is_dir():
+        return []
+    applied: list[str] = []
+    for path in sorted(changelog_root.glob("*.md")):
+        if operation.search(path.read_text()) and finding_effect_is_present(
+            workspace, path.stem, finding_id, finding
+        ):
+            applied.append(path.stem)
+    return applied
+
+
+def finding_effect_is_present(
+    workspace: Path,
+    skill: str,
+    finding_id: str,
+    finding: dict[str, object] | None,
+) -> bool:
+    """Check effect-sensitive idempotency for resource-opportunity findings."""
+    features = (
+        finding.get("features")
+        if isinstance(finding, dict) and isinstance(finding.get("features"), dict)
+        else {}
+    )
+    if features.get("candidate_source") != "resource_opportunity":
+        return True
+    resource = features.get("resource")
+    if resource not in pipeline_contracts.RESOURCE_KINDS:
+        return False
+    skill_dir = workspace / "target/to_be_improved_skills" / skill
+    authored = _resource_files(skill_dir).get(str(resource), [])
+    if not authored:
+        return False
+    contract_name = {
+        "scripts": "script_contract",
+        "references": "reference_contract",
+        "assets": "asset_contract",
+        "agents": "agent_contract",
+    }.get(str(resource))
+    contract = features.get(contract_name) if contract_name else None
+    if (
+        isinstance(contract, dict)
+        and contract.get("content_available") is True
+        and isinstance(contract.get("content"), str)
+    ):
+        expected = str(contract["content"])
+        try:
+            expected_json = json.loads(expected)
+        except json.JSONDecodeError:
+            expected_json = None
+        content_present = False
+        for relative in authored:
+            path = skill_dir / relative
+            try:
+                actual = path.read_text()
+            except OSError:
+                continue
+            if actual.strip() == expected.strip():
+                content_present = True
+                break
+            if expected_json is not None:
+                try:
+                    if json.loads(actual) == expected_json:
+                        content_present = True
+                        break
+                except json.JSONDecodeError:
+                    pass
+        if not content_present:
+            # A prior placeholder or reuse manifest is not the effect of a
+            # later, richer finding that carries complete source content.
+            return False
+    if resource != "evals":
+        return True
+    evals = skill_dir / "evals/evals.json"
+    try:
+        cases = json.loads(evals.read_text()).get("evals") or []
+    except (OSError, json.JSONDecodeError):
+        return False
+    marker = f"source:{finding_id}"
+    return any(
+        isinstance(case, dict) and marker in (case.get("source_trace_ids") or [])
+        for case in cases
+    )
+
+
+def recalled_skill_evidence(
+    skills_root: Path,
+    recalled: list[dict] | None,
+    *,
+    per_skill_chars: int = 2400,
+    resource_chars: int = 2400,
+) -> dict[str, object]:
+    """Bound current recalled content so Goal can distinguish update from no-change."""
+    rows: list[dict[str, object]] = []
+    for match in (recalled or [])[:5]:
+        if not isinstance(match, dict) or not match.get("skill"):
+            continue
+        skill = str(match["skill"])
+        path = skills_root / skill / "SKILL.md"
+        if not path.is_file():
+            continue
+        text = path.read_text()
+        resource_rows: list[dict[str, object]] = []
+        remaining = resource_chars
+        for kind, paths in sorted(_resource_files(path.parent).items()):
+            for relative in paths:
+                resource_path = path.parent / relative
+                raw = resource_path.read_bytes()
+                decoded = raw.decode(errors="replace")
+                preview = decoded[:remaining] if remaining > 0 else ""
+                remaining -= len(preview)
+                resource_rows.append(
+                    {
+                        "kind": kind,
+                        "path": relative.as_posix(),
+                        "sha256": hashlib.sha256(raw).hexdigest(),
+                        "bytes": len(raw),
+                        "content_preview": preview,
+                        "truncated": len(decoded) > len(preview),
+                    }
+                )
+        rows.append(
+            {
+                "skill": skill,
+                "score": match.get("score"),
+                "skill_md": text[:per_skill_chars],
+                "truncated": len(text) > per_skill_chars,
+                "resources": resource_rows,
+            }
+        )
+    return {
+        "instruction": (
+            "Choose no_change when current recalled guidance already satisfies "
+            "the diagnosed requirement and its listed resource files satisfy "
+            "the finding's contract. When a contract supplies complete content, "
+            "prose that names the resource or a placeholder file is not the "
+            "effect: update until a listed resource contains semantically "
+            "equivalent content. Do not restate or tighten guidance without new "
+            "behavior supported by the finding."
+        ),
+        "skills": rows,
+    }
+
+
+def embedding_recall(
+    diagnosis: dict, metadata: dict, skill_dirs: list[str], config: dict
+) -> dict:
+    """Recall skills semantically and normalize results to label-matching/v1."""
+    queries_by_cluster: dict[str, list[dict]] = {}
+    for key in (
+        "skill_capabilities_missing",
+        "newly_detected_skill_capabilites_missing",
+    ):
+        for row in diagnosis.get(key) or []:
+            if not isinstance(row, dict):
+                continue
+            cluster = str(row.get("cluster") or row.get("signal_id") or "cut")
+            queries_by_cluster.setdefault(cluster, []).append(row)
+    documents = {}
+    skills_root = Path(config["skills_root"])
+    records = (
+        metadata.get("skills_metadata")
+        if isinstance(metadata.get("skills_metadata"), list)
+        else []
+    )
+    metadata_by_name = {
+        str(row.get("skill")): row
+        for row in records
+        if isinstance(row, dict)
+    }
+    document_max_chars = int(config.get("document_max_chars", 2400))
+    if document_max_chars < 256:
+        raise ValueError("embedding recall document_max_chars must be at least 256")
+    for name in skill_dirs:
+        path = skills_root / name / "SKILL.md"
+        text = path.read_text() if path.is_file() else ""
+        documents[name] = text[:document_max_chars] + "\n" + json.dumps(
+            metadata_by_name.get(name, {}), ensure_ascii=False, sort_keys=True
+        )
+    names = sorted(queries_by_cluster) or ["cut"]
+    queries = [
+        json.dumps(queries_by_cluster.get(name, []), ensure_ascii=False, sort_keys=True)
+        for name in names
+    ]
+    provider = ACTIVE_EMBEDDING_PROVIDER or EmbeddingProvider(
+        config, INSTALL_ROOT / "services/embedding_api/server.py"
+    )
+    response = provider.search(
+        queries, documents, top_k=int(config.get("top_k", 10))
+    )
+    clusters = []
+    for name, result in zip(names, response["results"]):
+        matches = [
+            {
+                "skill": row["id"],
+                "score": row["score"],
+                "labels": [
+                    {"type": "embedding/semantic", "weight": row["score"]}
+                ],
+                "matches": [
+                    {
+                        "cluster_type": "embedding/query",
+                        "skill_type": "embedding/skill",
+                        "similarity": row["score"],
+                        "contribution": row["score"],
+                    }
+                ],
+            }
+            for row in result.get("matches") or []
+            if float(row.get("score", -1)) >= float(config.get("minimum_score", 0.3))
+        ]
+        clusters.append({"cluster": name, "labels": [], "skills": matches})
+    return {
+        "matching": {
+            "strategy": str(config["algorithm"]),
+            "config_version": 1,
+            "config_sha256": str(
+                ACTIVE_EXECUTION_CONFIG.get("config_digest", "")
+            ).removeprefix("sha256:"),
+            "model_revision": response.get("model_revision"),
+            "index_revision": response.get("index_revision"),
+            "service": "shared-embedding",
+            "cost_tier": 1,
+            "document_max_chars": document_max_chars,
+        },
+        "clusters": clusters,
+    }
+
+
+def run(
+    command: list[str],
+    *,
+    check: bool = True,
+    display: list[str] | None = None,
+    cwd: Path | None = None,
+    log_path: Path | None = None,
+    input_text: str | None = None,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess[str]:
+    print("+", " ".join(display or command), flush=True)
+    if log_path is None:
+        return subprocess.run(
+            command,
+            cwd=cwd or REPO,
+            text=True,
+            input=input_text,
+            check=check,
+            timeout=timeout,
+        )
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("w") as log:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd or REPO,
+            text=True,
+            stdin=subprocess.PIPE if input_text is not None else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        if input_text is not None and process.stdin is not None:
+            process.stdin.write(input_text)
+            process.stdin.close()
+
+        def pump_output() -> None:
+            if process.stdout is not None:
+                for line in process.stdout:
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                    log.write(line)
+
+        pump = threading.Thread(target=pump_output, daemon=True)
+        pump.start()
+        try:
+            code = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+            raise
+        finally:
+            pump.join(timeout=5)
+            if process.stdout is not None:
+                process.stdout.close()
+    if check and code != 0:
+        raise subprocess.CalledProcessError(code, command)
+    return subprocess.CompletedProcess(command, code)
+
+
+def failure_text(error: BaseException) -> str:
+    """Short lane failure text. Timeout errors omit the agent command."""
+    if isinstance(error, subprocess.TimeoutExpired):
+        if error.timeout is None:
+            return "timed out"
+        return f"timed out after {error.timeout} seconds"
+    lines = str(error).strip().splitlines()
+    text = lines[0] if lines else error.__class__.__name__
+    return text[:500]
+
+
+def require_auth() -> dict[str, str]:
+    names = (
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+    )
+    values = {name: os.environ[name] for name in names if os.environ.get(name)}
+    if not any(name in values for name in names[:3]):
+        raise SystemExit(
+            "Set ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, or "
+            "CLAUDE_CODE_OAUTH_TOKEN before running."
+        )
+    return values
+
+
+def initialize_workspace(workspace: Path) -> None:
+    if workspace.exists():
+        raise SystemExit(f"refusing to replace existing run: {workspace}")
+    pipeline_metrics.clear_shared_run(workspace)
+    workspace.mkdir(parents=True)
+    for relative in (
+        "logs",
+        "run",
+        "target/raw_skills",
+        "target/to_be_improved_skills",
+        "target/to_be_improved_skills_metadata",
+        "traces/raw/codex",
+        "traces/raw/claude",
+        "traces/raw/cursor",
+        "traces/raw/reference_agent",
+        "traces/derived/cut",
+    ):
+        (workspace / relative).mkdir(parents=True, exist_ok=True)
+    print(f"initialized {workspace}")
+    print("add raw traces and existing skills, then run again without --init")
+
+
+def initialize_inventory_workspace(workspace: Path) -> None:
+    """Create a trace-free seed from the stable candidate inventory."""
+    initialize_workspace(workspace)
+    inventory_root = inventory_store.resolve(active_inventory_root())
+    source_skills = inventory_root / "candidate_skills"
+    destination_skills = workspace / "target/to_be_improved_skills"
+    if source_skills.is_dir():
+        copied, invalid = copy_valid_skill_inventory(
+            source_skills, destination_skills
+        )
+        atomic_write_json(
+            workspace / "run/inventory-seed-validation.json",
+            {
+                "schema_version": 1,
+                "copied_skills": copied,
+                "invalid_skills": invalid,
+            },
+        )
+    source_metadata = inventory_root / "candidate_skills_metadata"
+    destination_metadata = workspace / "target/to_be_improved_skills_metadata"
+    if source_metadata.is_dir():
+        shutil.rmtree(destination_metadata)
+        shutil.copytree(source_metadata, destination_metadata)
+        metadata = destination_metadata / "metadata.json"
+        if metadata.is_file():
+            document = json.loads(metadata.read_text())
+            atomic_write_json(
+                metadata,
+                {
+                    "skills_metadata": [
+                        row
+                        for row in document.get("skills_metadata") or []
+                        if isinstance(row, dict) and row.get("skill") in copied
+                    ]
+                },
+            )
+    source_changelogs = inventory_root / "candidate_skills_changelog"
+    destination_changelogs = workspace / SKILL_CHANGELOG_DIR
+    destination_changelogs.mkdir(parents=True, exist_ok=True)
+    if source_changelogs.is_dir():
+        for skill in copied:
+            source = source_changelogs / f"{skill}.md"
+            if source.is_file():
+                shutil.copy2(source, destination_changelogs / source.name)
+
+
+def _contains_file(root: Path) -> bool:
+    if not root.exists():
+        return False
+    return any(
+        path.is_file() and path.name != ".DS_Store" for path in root.rglob("*")
+    )
+
+
+def validate_inventory_skill(skill_dir: Path) -> list[str]:
+    """Return all publication-blocking problems for one skill directory."""
+    problems = list(skill_format_checker.validate_authored_skill(skill_dir))
+    evals = skill_dir / "evals/evals.json"
+    if evals.is_file():
+        problems.extend(
+            skill_evaluation.validate_evals_file(evals, skill_dir.name)
+        )
+    return problems
+
+
+def copy_valid_skill_inventory(
+    source: Path, destination: Path
+) -> tuple[list[str], list[dict[str, object]]]:
+    """Copy only valid skill directories and report every excluded skill."""
+    destination.mkdir(parents=True, exist_ok=True)
+    copied: list[str] = []
+    invalid: list[dict[str, object]] = []
+    for skill_dir in sorted(source.iterdir(), key=lambda path: path.name.casefold()):
+        if not skill_dir.is_dir() or not (skill_dir / "SKILL.md").is_file():
+            continue
+        problems = validate_inventory_skill(skill_dir)
+        if problems:
+            invalid.append({"skill": skill_dir.name, "problems": problems})
+            continue
+        target = destination / skill_dir.name
+        if target.exists():
+            shutil.rmtree(target)
+        shutil.copytree(skill_dir, target)
+        copied.append(skill_dir.name)
+    return copied, invalid
+
+
+def workspace_was_started(workspace: Path) -> bool:
+    """True once a pipeline start has written output into this directory."""
+    if _contains_file(workspace / "logs") or _contains_file(
+        workspace / "traces/derived"
+    ):
+        return True
+    run_root = workspace / "run"
+    return run_root.is_dir() and any(
+        path.is_file()
+        and path.name != ".DS_Store"
+        and path.relative_to(run_root).as_posix() != "trace-selection.json"
+        for path in run_root.rglob("*")
+    )
+
+
+def allocate_execution_workspace(
+    source: Path, moment: datetime | None = None
+) -> Path:
+    """Move the seed into a minute-stamped execution directory.
+
+    Every start writes ``<run-id>@YYYY-MM-DDTHH:MM`` and removes the unstamped
+    seed. A second start in the same minute gets ``-2``.
+    """
+    started = moment.astimezone() if moment is not None else datetime.now().astimezone()
+    base = f"{source.name}@{started.strftime('%Y-%m-%dT%H:%M')}"
+    candidate = source.parent / base
+    suffix = 2
+    while candidate.exists():
+        candidate = source.parent / f"{base}-{suffix}"
+        suffix += 1
+    initialize_workspace(candidate)
+    for relative in ("traces/raw", "target"):
+        origin = source / relative
+        destination = candidate / relative
+        if not origin.is_dir():
+            continue
+        shutil.rmtree(destination)
+        shutil.copytree(origin, destination, symlinks=False)
+    selection = source / "run/trace-selection.json"
+    if selection.is_file():
+        shutil.copy2(selection, candidate / "run/trace-selection.json")
+    if candidate != source and "@" not in source.name:
+        shutil.rmtree(source)
+    print(f"execution directory: {candidate}")
+    return candidate
+
+
+def require_seed_inputs(workspace: Path) -> None:
+    trace_roots = (
+        workspace / "traces/raw/codex",
+        workspace / "traces/raw/claude",
+        workspace / "traces/raw/cursor",
+        workspace / "traces/raw/target_agent",
+    )
+    skills = workspace / "target/to_be_improved_skills"
+    if not any(any(root.glob("*.jsonl")) for root in trace_roots):
+        raise SystemExit(
+            "no supported trace jsonl files found under "
+            f"{workspace / 'traces/raw'}"
+        )
+    usable_skills = [
+        path
+        for path in skills.iterdir()
+        if path.is_dir()
+        and ((path / "SKILL.md").is_file() or (path / "skill.md").is_file())
+    ]
+    if not usable_skills:
+        raise SystemExit(f"no skill directories with SKILL.md or skill.md under {skills}")
+
+
+def skill_inventory_names(root: Path) -> set[str]:
+    """Return only usable skill directories, excluding residual empty folders."""
+    if not root.is_dir():
+        return set()
+    return {
+        path.name
+        for path in root.iterdir()
+        if path.is_dir()
+        and ((path / "SKILL.md").is_file() or (path / "skill.md").is_file())
+    }
+
+
+def require_skill_inputs(workspace: Path) -> None:
+    """Require an inventory, but deliberately permit an empty trace tree."""
+    skills = workspace / "target/to_be_improved_skills"
+    usable_skills = [
+        path
+        for path in skills.iterdir()
+        if path.is_dir()
+        and ((path / "SKILL.md").is_file() or (path / "skill.md").is_file())
+    ]
+    if not usable_skills:
+        raise SystemExit(f"no skill directories with SKILL.md or skill.md under {skills}")
+
+
+def build_images() -> None:
+    run(
+        [
+            "docker",
+            "build",
+            "-f",
+            "skill_evolving_agents/Dockerfile.agent-runtime",
+            "-t",
+            AGENT_RUNTIME_IMAGE,
+            "skill_evolving_agents",
+        ]
+    )
+
+
+def instruction(
+    stage: str,
+    context: str,
+    *,
+    cluster: bool = False,
+    skill_paths: list[str] | None = None,
+) -> str:
+    paths = list(skill_paths if skill_paths is not None else SKILLS[stage])
+    if stage == "preprocessing" and cluster:
+        paths.append("01_preprocessing_agent/cluster/skill.md")
+    skills = "\n".join(f"- {path}" for path in paths)
+    if stage == "optimize":
+        scope = (
+            "Fast decision. One pass.\n\n"
+            "Read AGENT.md and these skill files:\n"
+            f"{skills}\n\n"
+            "The working directory is `workspace/`. It contains the target skill "
+            "directory and that skill's changelog beside it, `<skill>.md`. "
+            "Explore that skill and its changelog. Edit the skill directory. "
+            "Do not edit the changelog. Do not read or write metadata; the runner does that.\n"
+            "Do not open the parent repository, other stages, logs, pipeline traces, "
+            "raw vendor logs, or any skill this session does not name.\n"
+        )
+    else:
+        scope = (
+            "Fast decision. One pass. Do not explore.\n\n"
+            "Read only AGENT.md and these skill files:\n"
+            f"{skills}\n\n"
+            "Then read only the input paths named in the session block below. "
+            "Write the required output and stop.\n"
+            "Do not open the parent repository, other stages, logs, pipeline traces, "
+            "raw vendor logs, or any cluster, finding, or skill this session does not name.\n"
+            "Do not search. Do not reread a file. Run a command only when one of those "
+            "skill files tells you to run that command.\n"
+        )
+    return f"""{scope}Follow the output schema and stop condition in the stage skill; do not substitute a generic decision object.
+Do not ask questions. Do not work on another stage, cluster, or op.
+
+Session:
+{context}
+
+The host records execution status. Do not write logs or status records.
+Exit nonzero if the required output cannot be produced.
+"""
+
+
+def session_command(model: str | None, _install_agent: bool) -> str:
+    parts = ["set -eu"]
+    parts.append("command -v claude >/dev/null")
+    model_arg = f" --model {shlex.quote(model)}" if model else ""
+    parts.append(
+        'printf "%s" "$SESSION_INSTRUCTION" | '
+        "claude --dangerously-skip-permissions --verbose "
+        f"--output-format=stream-json{model_arg} --print"
+    )
+    return "; ".join(parts)
+
+
+def run_docker_session(
+    stage: str,
+    workspace: Path,
+    prompt: str,
+    auth: dict[str, str],
+    model: str | None,
+    install_agent: bool,
+    suffix: str,
+    log_path: Path | None = None,
+    details: dict[str, object] | None = None,
+    json_output: bool = False,
+    input_root: Path | None = None,
+) -> None:
+    del json_output
+    data_root = input_root or workspace
+    safe_suffix = re.sub(r"[^a-zA-Z0-9_.-]+", "-", suffix).strip("-")
+    name = f"skill-evolver-{stage}-{safe_suffix}"[:120]
+    container_root = "/opt/skill-evolver/skill_evolving_agents"
+    mounts = [
+        (
+            ROOT / AGENT_FILES[stage],
+            f"{container_root}/AGENT.md",
+        ),
+        (
+            ROOT / STAGE_DIRS[stage],
+            f"{container_root}/{STAGE_DIRS[stage]}",
+        ),
+        (ROOT / "common", f"{container_root}/common"),
+        (
+            ROOT / "skill_capabilites",
+            f"{container_root}/skill_capabilites",
+        ),
+    ]
+    command = [
+        "docker",
+        "run",
+        "--rm",
+        "--name",
+        name,
+        "-v",
+        f"{data_root}:{CONTAINER_WORKSPACE}",
+        "-e",
+        f"SESSION_INSTRUCTION={prompt}",
+        "-e",
+        f"STAGE_DIR={STAGE_DIRS[stage]}",
+    ]
+    for source, target in mounts:
+        command.extend(["-v", f"{source.resolve()}:{target}:ro"])
+    for key in auth:
+        command.extend(["-e", key])
+    command.extend(
+        [
+            AGENT_RUNTIME_IMAGE,
+            "sh",
+            "-lc",
+            session_command(model, install_agent),
+        ]
+    )
+    if details is not None:
+        details["session_cwd"] = "docker"
+        details["session_add_dir"] = str(data_root)
+    run(
+        command,
+        display=[
+            "docker",
+            "run",
+            "--rm",
+            "--name",
+            name,
+            "-v",
+            f"{data_root}:{CONTAINER_WORKSPACE}",
+            "[credentials and instruction omitted]",
+            AGENT_RUNTIME_IMAGE,
+        ],
+        log_path=log_path,
+        timeout=session_timeout_seconds(stage),
+    )
+
+
+def authenticated(command: list[str]) -> bool:
+    try:
+        result = subprocess.run(
+            command,
+            cwd=REPO,
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            # Packaged CLIs may cold-start their embedded runtime before
+            # printing a version or auth status. DSH has exceeded 15 seconds
+            # on a cold mounted application image, producing a false
+            # "not installed" result before any agent request was attempted.
+            timeout=30,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def resolve_dsh_binary() -> str:
+    """Resolve the official DeepSeek Harness launcher without example wrappers."""
+    configured = os.environ.get("DSH_BIN", "").strip()
+    if configured:
+        return configured
+    installed = shutil.which("dsh")
+    if installed:
+        return installed
+    patterns = (
+        "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh",
+        "/Volumes/DeepSeek Harness*/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh",
+    )
+    for pattern in patterns:
+        for candidate in sorted(glob.glob(pattern)):
+            if os.access(candidate, os.X_OK):
+                return candidate
+    return "dsh"
+
+
+def resolve_hermes_binary() -> str:
+    """Resolve Hermes from PATH or the sibling OSS checkout."""
+    configured = os.environ.get("HERMES_BIN", "").strip()
+    if configured:
+        return configured
+    installed = shutil.which("hermes")
+    if installed:
+        return installed
+    candidate = REPO.parent.parent / "oss/hermes-agent/.venv/bin/hermes"
+    if os.access(candidate, os.X_OK):
+        return str(candidate)
+    return "hermes"
+
+
+def resolve_openclaw_launcher() -> list[str]:
+    """Resolve OpenClaw from PATH or the sibling OSS checkout."""
+    configured = os.environ.get("OPENCLAW_BIN", "").strip()
+    if configured:
+        return [configured]
+    installed = shutil.which("openclaw")
+    if installed:
+        return [installed]
+    checkout = REPO.parent.parent / "oss/openclaw/openclaw.mjs"
+    if checkout.is_file():
+        configured_node = os.environ.get("OPENCLAW_NODE", "").strip()
+        node_candidates = [configured_node] if configured_node else []
+        node_candidates.extend(
+            sorted(
+                glob.glob(str(Path.home() / ".nvm/versions/node/*/bin/node")),
+                reverse=True,
+            )
+        )
+        path_node = shutil.which("node")
+        if path_node:
+            node_candidates.append(path_node)
+        for node in node_candidates:
+            if node and os.access(node, os.X_OK):
+                return [node, str(checkout)]
+    return ["openclaw"]
+
+
+def load_agent_config(path: Path | None = None) -> dict:
+    """Load agent backends. Exactly one entry has status active."""
+    source = AGENT_CONFIG_PATH if path is None else path
+    try:
+        data = json.loads(source.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise SystemExit(f"invalid agent config {source}: {error}") from error
+    if data.get("schema_version") != 1:
+        raise SystemExit(f"unsupported agent config: {source}")
+    agents = data.get("agents")
+    if not isinstance(agents, list) or not agents:
+        raise SystemExit("agent config agents must be a non-empty list")
+    seen: set[str] = set()
+    active = 0
+    for index, row in enumerate(agents):
+        where = f"agents[{index}]"
+        if not isinstance(row, dict):
+            raise SystemExit(f"{where} must be an object")
+        backend = row.get("backend")
+        status = row.get("status")
+        model = row.get("model")
+        if backend not in KNOWN_BACKENDS:
+            raise SystemExit(f"{where}.backend is unknown: {backend}")
+        if not isinstance(backend, str) or backend in seen:
+            raise SystemExit(f"{where}.backend duplicates {backend}")
+        seen.add(backend)
+        if status not in {"active", "inactive"}:
+            raise SystemExit(f"{where}.status must be active or inactive")
+        if not isinstance(model, str):
+            raise SystemExit(f"{where}.model must be a string")
+        if status == "active":
+            active += 1
+            if not model.strip():
+                raise SystemExit(f"active agent {backend} needs a model")
+    if active != 1:
+        raise SystemExit(
+            f"agent config must mark exactly one agent active, found {active}"
+        )
+    return data
+
+
+def active_agent(config: dict | None = None) -> dict:
+    data = load_agent_config() if config is None else config
+    return next(row for row in data["agents"] if row["status"] == "active")
+
+
+def configured_model(
+    backend: str, override: str | None = None, config: dict | None = None
+) -> str:
+    if isinstance(override, str) and override.strip():
+        return override.strip()
+    if backend == "dsh":
+        patch = (
+            os.environ.get("DSH_PATCH", "").strip()
+            or os.environ.get("SKILL_EVOLVER_DSH_PATCH", "").strip()
+        )
+        if Path(patch).name == "dsh-deepseek-account.patch.yml":
+            return "deepseek-flash"
+    data = load_agent_config() if config is None else config
+    for row in data["agents"]:
+        if row["backend"] == backend:
+            model = str(row["model"]).strip()
+            if not model:
+                raise SystemExit(f"{backend} has no model in agent config")
+            return model
+    raise SystemExit(f"{backend} is not in agent config")
+
+
+def embedding_fallback_config(runtime: dict) -> dict:
+    fallback = {**runtime, "backend": "hashing-reference"}
+    for field in ("model", "revision", "device", "query_instruction"):
+        fallback.pop(field, None)
+    return fallback
+
+
+def record_embedding_fallback(
+    workspace: Path, runtime: dict, error: BaseException
+) -> None:
+    atomic_write_json(
+        workspace / "run/config/embedding-runtime-fallback.json",
+        {
+            "schema_version": 1,
+            "requested_backend": runtime.get("backend"),
+            "selected_backend": "hashing-reference",
+            "reason": str(error),
+        },
+    )
+    print(
+        "embedding runtime fallback: hashing-reference "
+        f"({failure_text(error)})",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def select_backend(requested: str, allow_local: bool) -> str:
+    del allow_local
+    config = load_agent_config()
+    if requested == "auto":
+        backend = str(active_agent(config)["backend"])
+    else:
+        known = {str(row["backend"]) for row in config["agents"]}
+        if requested not in known:
+            raise SystemExit(f"{requested} is not in agent config")
+        backend = requested
+    if backend == "docker-claude":
+        print(f"selected agent backend: {backend}")
+        return backend
+    checks = {
+        "cursor": ["agent", "models"],
+        "codex": ["codex", "login", "status"],
+        "claude": ["claude", "auth", "status"],
+        "dsh": [resolve_dsh_binary(), "--version"],
+        "hermes": [resolve_hermes_binary(), "--version"],
+        "openclaw": [*resolve_openclaw_launcher(), "--version"],
+    }
+    if not authenticated(checks[backend]):
+        raise SystemExit(f"{backend} is not installed or authenticated")
+    print(f"selected agent backend: {backend}")
+    return backend
+
+
+def make_session_view(stage: str, workspace: Path, suffix: str) -> Path:
+    safe = re.sub(r"[^a-zA-Z0-9_.-]+", "-", suffix).strip("-")
+    base = SESSION_ROOT / f"{safe}-{stage}"
+    if base.exists():
+        shutil.rmtree(base)
+    agent_root = base / "skill_evolving_agents"
+    agent_root.mkdir(parents=True)
+    shutil.copy2(ROOT / AGENT_FILES[stage], agent_root / "AGENT.md")
+    shutil.copytree(
+        ROOT / STAGE_DIRS[stage],
+        agent_root / STAGE_DIRS[stage],
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    shutil.copytree(
+        ROOT / "common",
+        agent_root / "common",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    shutil.copytree(
+        ROOT / "skill_capabilites",
+        agent_root / "skill_capabilites",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    (agent_root / "workspace").symlink_to(workspace, target_is_directory=True)
+    return agent_root
+
+
+def make_dsh_session_view(stage: str, workspace: Path, suffix: str) -> Path:
+    """Create an isolated read-only DSH view for parallel verifier checks."""
+    safe = re.sub(r"[^a-zA-Z0-9_.-]+", "-", suffix).strip("-")
+    view = workspace / ".dsh-sessions" / safe
+    if view.exists():
+        shutil.rmtree(view)
+    view.mkdir(parents=True)
+    shutil.copy2(ROOT / AGENT_FILES[stage], view / "AGENT.md")
+    for relative in (STAGE_DIRS[stage], "common", "skill_capabilites"):
+        target = view / relative
+        shutil.copytree(
+            ROOT / relative,
+            target,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+    link = view / "workspace"
+    link.symlink_to(workspace, target_is_directory=True)
+    return view
+
+
+def make_dsh_writable_view(stage: str, workspace: Path) -> Path:
+    """Stage inputs in a worker that DSH must be able to modify.
+
+    Each diagnosis, goal, and optimize worker is already isolated. Keeping its
+    cwd at the worker root is required because DSH confines writes to its cwd;
+    a symlink from a nested session view does not extend that sandbox.
+    """
+    shutil.copy2(ROOT / AGENT_FILES[stage], workspace / "AGENT.md")
+    for relative in (STAGE_DIRS[stage], "common", "skill_capabilites"):
+        target = workspace / relative
+        if target.exists():
+            shutil.rmtree(target)
+        shutil.copytree(
+            ROOT / relative,
+            target,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+    link = workspace / "workspace"
+    if link.exists() or link.is_symlink():
+        link.unlink()
+    link.symlink_to(workspace, target_is_directory=True)
+    return workspace
+
+
+def remove_dsh_session_view(view: Path) -> None:
+    """Remove one temporary DSH input view while preserving worker artifacts."""
+    parent = view.parent
+    shutil.rmtree(view, ignore_errors=True)
+    try:
+        parent.rmdir()
+    except OSError:
+        pass
+
+
+def remove_dsh_writable_view(stage: str, workspace: Path) -> None:
+    """Remove staged DSH inputs while retaining the worker's run artifacts."""
+    for relative in (
+        "workspace",
+        "AGENT.md",
+        STAGE_DIRS[stage],
+        "common",
+        "skill_capabilites",
+    ):
+        path = workspace / relative
+        if path.is_symlink() or path.is_file():
+            path.unlink(missing_ok=True)
+        elif path.is_dir():
+            shutil.rmtree(path)
+
+
+def cursor_command(
+    view: Path, workspace: Path, prompt: str, model: str | None
+) -> list[str]:
+    """Launch Cursor with the session view as its only project root.
+
+    The run data is a second root so the sandbox can write `workspace/`.
+    The process cwd is the session view, outside the source git repository.
+    """
+    command = [
+        "agent",
+        "--workspace",
+        str(view),
+        "--trust",
+        "--print",
+        "--force",
+        "--sandbox",
+        "enabled",
+        "--output-format",
+        "stream-json",
+        "--add-dir",
+        str(workspace),
+    ]
+    if model:
+        command.extend(["--model", model])
+    command.append(prompt)
+    return command
+
+
+def dsh_command(prompt: str, model: str | None = None) -> list[str]:
+    """Launch one official DeepSeek Harness headless task."""
+    command = [resolve_dsh_binary(), "--profile", "headless"]
+    patch = (
+        os.environ.get("DSH_PATCH", "").strip()
+        or os.environ.get("SKILL_EVOLVER_DSH_PATCH", "").strip()
+    )
+    if not patch and model == "flint":
+        patch = str(ROOT / "config/dsh-flint.patch.yml")
+    if patch:
+        patch_path = Path(patch).expanduser()
+        if not patch_path.is_absolute():
+            patch_path = ROOT / patch_path
+        command.extend(["--patch", str(patch_path.resolve())])
+    command.append(prompt)
+    return command
+
+
+def hermes_command(prompt: str, model: str | None) -> list[str]:
+    """Launch one non-interactive Hermes agent turn."""
+    command = [resolve_hermes_binary()]
+    if model:
+        command.extend(["--model", model])
+    command.extend(["--oneshot", prompt])
+    return command
+
+
+def openclaw_command(view: Path, model: str | None) -> list[str]:
+    """Launch one isolated OpenClaw coding turn with stdin as its message."""
+    command = [
+        *resolve_openclaw_launcher(),
+        "agent",
+        "exec",
+        "--message-file",
+        "-",
+        "--cwd",
+        str(view),
+    ]
+    if model:
+        command.extend(["--model", model])
+    return command
+
+
+def run_host_session(
+    backend: str,
+    stage: str,
+    workspace: Path,
+    prompt: str,
+    model: str | None,
+    suffix: str,
+    log_path: Path | None = None,
+    details: dict[str, object] | None = None,
+    json_output: bool = False,
+    input_root: Path | None = None,
+) -> None:
+    data_root = input_root or workspace
+    isolated_dsh_view = backend == "dsh" and stage == "verifiter"
+    if isolated_dsh_view:
+        view = make_dsh_session_view(stage, data_root, suffix)
+    elif backend == "dsh":
+        view = make_dsh_writable_view(stage, data_root)
+    else:
+        view = make_session_view(stage, data_root, suffix)
+    allowed = [str(data_root)]
+    if details is not None:
+        details["session_cwd"] = str(view)
+        details["session_add_dir"] = str(data_root)
+
+    try:
+        if backend == "cursor":
+            command = cursor_command(view, data_root, prompt, model)
+            run(
+                command,
+                cwd=view,
+                log_path=log_path,
+                timeout=session_timeout_seconds(stage),
+            )
+        elif backend in {"codex", "ollama"}:
+            command = [
+                "codex",
+                "exec",
+                "--cd",
+                str(view),
+                "--approve-for-me",
+                "--skip-git-repo-check",
+                "--ephemeral",
+            ]
+            if json_output:
+                command.append("--json")
+            for path in allowed:
+                command.extend(["--add-dir", path])
+            if backend == "ollama":
+                command.extend(
+                    [
+                        "--oss",
+                        "--local-provider",
+                        "ollama",
+                        "--model",
+                        model or "qwen2.5-coder:1.5b",
+                    ]
+                )
+            elif model:
+                command.extend(["--model", model])
+            command.append("-")
+            print(f"+ {backend} session {stage} ({suffix})", flush=True)
+            run(
+                command,
+                cwd=view,
+                log_path=log_path,
+                input_text=prompt,
+                timeout=session_timeout_seconds(stage),
+            )
+        elif backend == "dsh":
+            run(
+                dsh_command(prompt, model),
+                cwd=view,
+                log_path=log_path,
+                timeout=session_timeout_seconds(stage),
+            )
+        elif backend == "hermes":
+            run(
+                hermes_command(prompt, model),
+                cwd=view,
+                log_path=log_path,
+                timeout=session_timeout_seconds(stage),
+            )
+        elif backend == "openclaw":
+            run(
+                openclaw_command(view, model),
+                cwd=view,
+                log_path=log_path,
+                input_text=prompt,
+                timeout=session_timeout_seconds(stage),
+            )
+        elif backend == "claude":
+            command = [
+                "claude",
+                "--safe-mode",
+                "--print",
+                "--dangerously-skip-permissions",
+                "--no-session-persistence",
+                "--verbose",
+                "--output-format",
+                "stream-json",
+            ]
+            for path in allowed:
+                command.extend(["--add-dir", path])
+            command.extend(["--model", model or "claude-sonnet-5-5"])
+            print(f"+ claude session {stage} ({suffix})", flush=True)
+            run(
+                command,
+                cwd=view,
+                log_path=log_path,
+                input_text=prompt,
+                timeout=session_timeout_seconds(stage),
+            )
+        else:
+            raise SystemExit(f"unknown agent backend: {backend}")
+    finally:
+        if isolated_dsh_view:
+            remove_dsh_session_view(view)
+        elif backend == "dsh":
+            remove_dsh_writable_view(stage, data_root)
+        else:
+            shutil.rmtree(view.parent, ignore_errors=True)
+
+
+def metrics_workspace(workspace: Path) -> Path:
+    worker_root = ROOT / ".pipeline-workers"
+    try:
+        relative = workspace.resolve().relative_to(worker_root.resolve())
+    except ValueError:
+        return workspace
+    run_id = relative.parts[0]
+    authoritative = ROOT / "workspace/runs" / run_id
+    return authoritative if authoritative.is_dir() else workspace
+
+
+def session_log_path(workspace: Path, stage: str, suffix: str) -> Path:
+    return (
+        metrics_workspace(workspace)
+        / "logs/sessions"
+        / stage
+        / f"{safe_name(suffix)}.jsonl"
+    )
+
+
+def session_counts(path: Path) -> dict[str, object]:
+    """Count stream events without interpreting the agent protocol."""
+    if not path.is_file():
+        return {"session_lines": 0, "tool_events": 0}
+    lines = [
+        line
+        for line in path.read_text(errors="replace").splitlines()
+        if line.strip()
+    ]
+    tool_events = sum(
+        1 for line in lines if "tool_call" in line or "tool_use" in line
+    )
+    return {"session_lines": len(lines), "tool_events": tool_events}
+
+
+def copy_worker(workspace: Path, stage: str, item: str) -> Path:
+    """Copy a run into an isolated worker and time that copy."""
+    started_at = datetime.now(UTC)
+    started_us = time.time_ns() // 1000
+    private = create_worker_workspace(workspace, stage, item)
+    pipeline_metrics.record_span(
+        metrics_workspace(workspace),
+        phase="worker-copy",
+        item=item,
+        category="orchestration",
+        started_at=started_at,
+        started_at_us=started_us,
+        duration_us=time.time_ns() // 1000 - started_us,
+        status="ok",
+    )
+    return private
+
+
+def record_queue(
+    workspace: Path,
+    phase: str,
+    item: str,
+    ready_us: int,
+    metadata: dict[str, object],
+) -> float:
+    """Record the wait from when a pool item was eligible until it started."""
+    now_us = time.time_ns() // 1000
+    wait_ms = round(max(0, now_us - ready_us) / 1000, 3)
+    pipeline_metrics.record_span(
+        metrics_workspace(workspace),
+        phase=phase,
+        item=item,
+        category="orchestration",
+        started_at=datetime.fromtimestamp(ready_us / 1_000_000, UTC),
+        started_at_us=ready_us,
+        duration_us=max(0, now_us - ready_us),
+        status="ok",
+        metadata={**metadata, "queue_wait_ms": wait_ms},
+    )
+    return wait_ms
+
+
+def diagnosis_slice_metadata(
+    workspace: Path, cluster: str, unit_kind: str
+) -> dict[str, object]:
+    """Token and user-turn size of the slice a diagnosis session is given."""
+    if unit_kind == "finding":
+        path = workspace / "traces/derived/findings" / cluster / "finding.json"
+        slices: list[dict[str, object]] = []
+        if path.is_file():
+            try:
+                data = json.loads(path.read_text())
+            except json.JSONDecodeError:
+                data = {}
+            raw_slice = data.get("slice") if isinstance(data, dict) else None
+            if isinstance(raw_slice, dict):
+                slices.append(raw_slice)
+    else:
+        path = workspace / "traces/derived/cluster" / cluster / "cut.jsonl"
+        slices = []
+        if path.is_file():
+            for line in path.read_text().splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                raw_slice = row.get("slice") if isinstance(row, dict) else None
+                if isinstance(raw_slice, dict):
+                    slices.append(raw_slice)
+    if not slices:
+        return {"slice_present": False, "slice_count": 0}
+    tokens = [int(item.get("token_estimate") or 0) for item in slices]
+    turns = [int(item.get("user_turns") or 0) for item in slices]
+    truncated = any(
+        any(
+            bool(turn.get("truncated"))
+            for turn in (item.get("turns") or [])
+            if isinstance(turn, dict)
+        )
+        for item in slices
+    )
+    return {
+        "slice_present": True,
+        "slice_count": len(slices),
+        "slice_user_turns": sum(turns),
+        "slice_tokens": sum(tokens),
+        "slice_max_tokens": max(tokens),
+        "slice_truncated": truncated,
+    }
+
+
+def session_timeout_seconds(stage: str) -> int:
+    """Clamp a stage timeout to the remaining end-to-end run budget."""
+    configured = (
+        VERIFIER_SESSION_TIMEOUT_SECONDS
+        if stage == "verifiter"
+        else AGENT_SESSION_TIMEOUT_SECONDS
+    )
+    if ACTIVE_RUN_DEADLINE_MONOTONIC is None:
+        return configured
+    remaining = int(ACTIVE_RUN_DEADLINE_MONOTONIC - time.monotonic())
+    return max(1, min(configured, remaining))
+
+
+def configure_run_deadline(workspace: Path) -> dict[str, object]:
+    """Set an end-to-end ceiling that can accommodate the enabled agent stages."""
+    global ACTIVE_RUN_DEADLINE_MONOTONIC
+    selection = workspace / "run/trace-selection.json"
+    turns = 0
+    if selection.is_file():
+        try:
+            value = json.loads(selection.read_text()).get("turns", 0)
+            if isinstance(value, int) and not isinstance(value, bool):
+                turns = value
+        except json.JSONDecodeError:
+            pass
+    configured_budget = os.environ.get("SKILL_EVOLVER_RUN_BUDGET_SECONDS")
+    if configured_budget:
+        budget_seconds = max(1, int(configured_budget))
+        budget_source = "environment"
+    else:
+        # A changing run can invoke diagnosis, goal, optimize, and verification.
+        # The former 300-second short-run ceiling was lower than the sum of the
+        # stage ceilings (3 * 180 + 360), so a healthy late-stage session could
+        # be killed solely because earlier stages used their allowed time.
+        budget_seconds = 1200 if turns > 30 else 900
+        budget_source = "derived-default"
+    ACTIVE_RUN_DEADLINE_MONOTONIC = time.monotonic() + budget_seconds
+    document: dict[str, object] = {
+        "schema_version": 1,
+        "turns": turns,
+        "budget_seconds": budget_seconds,
+        "budget_source": budget_source,
+        "classification": "long" if turns > 30 else "short",
+        "policy": "end-to-end-agent-timeout-clamp-v1",
+    }
+    atomic_write_json(workspace / "run/config/runtime-budget.json", document)
+    return document
+
+
+def inventory_merge_candidates(
+    workspace: Path,
+    metadata_path: Path,
+    *,
+    min_score: float = 0.72,
+) -> dict[str, object]:
+    """Build deterministic, auditable merge candidates for the skill inventory.
+
+    Exact methodology fingerprints are the strongest evidence. Otherwise the
+    score combines weighted capability-label overlap with bounded lexical
+    overlap. This only nominates pairs; the goal, verifier, and judge retain
+    authority to reject a merge.
+    """
+    metadata = json.loads(metadata_path.read_text())
+    rows = {
+        str(row.get("skill")): row
+        for row in metadata.get("skills_metadata") or []
+        if isinstance(row, dict) and isinstance(row.get("skill"), str)
+    }
+    skills_root = workspace / "target/to_be_improved_skills"
+    changelog_root = workspace / SKILL_CHANGELOG_DIR
+
+    def labels(row: dict[str, object]) -> dict[str, float]:
+        result: dict[str, float] = {}
+        for item in row.get("skill_types") or []:
+            if not isinstance(item, dict) or not isinstance(item.get("type"), str):
+                continue
+            result[item["type"]] = max(
+                result.get(item["type"], 0.0), float(item.get("weight") or 0)
+            )
+        return result
+
+    def tokens(name: str) -> set[str]:
+        path = skills_root / name / "SKILL.md"
+        if not path.is_file():
+            return set()
+        return {
+            token
+            for token in re.findall(r"[a-z][a-z0-9_-]{2,}", path.read_text().lower())
+            if token not in {"the", "and", "for", "this", "that", "with", "when"}
+        }
+
+    def applied_findings(name: str) -> dict[str, set[str]]:
+        path = changelog_root / f"{name}.md"
+        if not path.is_file():
+            return {}
+        result: dict[str, set[str]] = {}
+        for operation, finding in re.findall(
+            r"^- \d{4}-\d{2}-\d{2} (create|update|merge|split) "
+            r"([^/\s]+)/\d+\b",
+            path.read_text(),
+            re.MULTILINE,
+        ):
+            result.setdefault(finding, set()).add(operation)
+        return result
+
+    candidates: list[dict[str, object]] = []
+    names = sorted(rows)
+    for index, left in enumerate(names):
+        for right in names[index + 1 :]:
+            left_row, right_row = rows[left], rows[right]
+            left_labels, right_labels = labels(left_row), labels(right_row)
+            all_labels = set(left_labels) | set(right_labels)
+            label_overlap = (
+                sum(min(left_labels.get(key, 0), right_labels.get(key, 0)) for key in all_labels)
+                / sum(max(left_labels.get(key, 0), right_labels.get(key, 0)) for key in all_labels)
+                if all_labels
+                else 0.0
+            )
+            left_tokens, right_tokens = tokens(left), tokens(right)
+            lexical_overlap = (
+                len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+                if left_tokens | right_tokens
+                else 0.0
+            )
+            left_fp = ((left_row.get("lifecycle") or {}).get("method_fingerprint"))
+            right_fp = ((right_row.get("lifecycle") or {}).get("method_fingerprint"))
+            same_method = bool(left_fp and left_fp == right_fp)
+            left_findings = applied_findings(left)
+            right_findings = applied_findings(right)
+            shared_findings = sorted(
+                finding
+                for finding in set(left_findings) & set(right_findings)
+                if "create" in left_findings[finding]
+                or "create" in right_findings[finding]
+            )
+            created_for_shared = sorted(
+                name
+                for name, findings in ((left, left_findings), (right, right_findings))
+                if any("create" in findings[finding] for finding in shared_findings)
+            )
+            prior_owners = sorted(set((left, right)) - set(created_for_shared))
+            score = (
+                1.0
+                if same_method
+                else max(
+                    0.95 if shared_findings else 0.0,
+                    0.8 * label_overlap + 0.2 * lexical_overlap,
+                )
+            )
+            if score < min_score:
+                continue
+            reasons = []
+            if same_method:
+                reasons.append("same_method_fingerprint")
+            if shared_findings:
+                reasons.append("duplicate_create_evidence_collision")
+            if label_overlap:
+                reasons.append("capability_overlap")
+            if lexical_overlap:
+                reasons.append("instruction_overlap")
+            candidates.append(
+                {
+                    "skills": [left, right],
+                    "score": round(score, 6),
+                    "label_overlap": round(label_overlap, 6),
+                    "lexical_overlap": round(lexical_overlap, 6),
+                    "method_fingerprint": left_fp if same_method else None,
+                    "shared_finding_ids": shared_findings,
+                    "operation_hint": "merge" if shared_findings else None,
+                    "created_skill": (
+                        created_for_shared[0] if len(created_for_shared) == 1 else None
+                    ),
+                    "prior_owner": (
+                        prior_owners[0]
+                        if len(created_for_shared) == 1 and len(prior_owners) == 1
+                        else None
+                    ),
+                    "distinct_sessions": max(
+                        int((left_row.get("lifecycle") or {}).get("distinct_sessions") or 0),
+                        int((right_row.get("lifecycle") or {}).get("distinct_sessions") or 0),
+                    ),
+                    "reasons": reasons,
+                    "decision": "review",
+                }
+            )
+    retirement = inventory_retirement_candidates(workspace, metadata_path)
+    candidates.extend(retirement)
+    document = {
+        "schema_version": 1,
+        "algorithm": "inventory-maintenance-candidates-v2",
+        "min_score": min_score,
+        "candidate_count": len(candidates),
+        "candidates": sorted(candidates, key=lambda row: (-float(row["score"]), row["skills"])),
+    }
+    path = workspace / "run/inventory-merge-candidates.json"
+    atomic_write_json(path, document)
+    return document
+
+
+def ensure_lifecycle_evaluation_baselines(metadata_path: Path) -> list[str]:
+    """Give legacy inventory entries a one-time retirement observation baseline."""
+    document = json.loads(metadata_path.read_text())
+    changed: list[str] = []
+    baseline = datetime.now(UTC).isoformat()
+    for row in document.get("skills_metadata") or []:
+        if not isinstance(row, dict) or not isinstance(row.get("skill"), str):
+            continue
+        lifecycle = row.get("lifecycle")
+        if not isinstance(lifecycle, dict):
+            lifecycle = {}
+            row["lifecycle"] = lifecycle
+        required_baseline_fields = (
+            "status",
+            "origin_run_id",
+            "origin_finding_id",
+            "origin_session_ids",
+            "confidence",
+            "evidence_records",
+            "distinct_windows",
+            "evaluated_at",
+        )
+        legacy_backfill = any(
+            lifecycle.get(field) in (None, "", [])
+            for field in required_baseline_fields
+        )
+        defaults = {
+            "status": "stable",
+            "origin_run_id": "legacy-inventory",
+            "origin_finding_id": f"legacy-import:{row['skill']}",
+            "origin_session_ids": ["legacy-inventory"],
+            "confidence": 1.0,
+            "evidence_records": 0,
+            "distinct_windows": 0,
+            "evaluated_at": baseline,
+            "evaluation_kind": "legacy_inventory_backfill",
+        }
+        if legacy_backfill:
+            defaults["evaluation_baseline_reason"] = "legacy_inventory_backfill"
+        row_changed = False
+        for field, value in defaults.items():
+            if lifecycle.get(field) in (None, "", []):
+                lifecycle[field] = value
+                row_changed = True
+        if row_changed:
+            changed.append(str(row["skill"]))
+    if changed:
+        atomic_write_json(metadata_path, document)
+    return changed
+
+
+def inventory_retirement_candidates(
+    workspace: Path,
+    metadata_path: Path,
+    *,
+    min_post_creation_scopes: int = 20,
+    max_recall_count: int = 0,
+    min_content_containment: float = 0.9,
+    min_label_containment: float = 0.9,
+) -> list[dict[str, object]]:
+    """Nominate deletion only after observed non-use and strong subsumption.
+
+    Old runs cannot count against a newly created skill: only label-matching
+    artifacts written after its lifecycle evaluation timestamp are eligible.
+    A quiet skill is still retained unless one other valid skill covers both
+    its weighted capability labels and nearly all of its instruction tokens.
+    """
+    metadata = json.loads(metadata_path.read_text())
+    rows = {
+        str(row.get("skill")): row
+        for row in metadata.get("skills_metadata") or []
+        if isinstance(row, dict) and isinstance(row.get("skill"), str)
+    }
+    skills_root = workspace / "target/to_be_improved_skills"
+    metrics_database = workspace.parents[1] / "metrics.sqlite"
+
+    def evaluated_timestamp(row: dict[str, object]) -> float | None:
+        value = (row.get("lifecycle") or {}).get("evaluated_at")
+        if not isinstance(value, str):
+            return None
+        try:
+            return datetime.fromisoformat(value).timestamp()
+        except ValueError:
+            return None
+
+    def labels(row: dict[str, object]) -> dict[str, float]:
+        return {
+            str(item["type"]): float(item.get("weight") or 0)
+            for item in row.get("skill_types") or []
+            if isinstance(item, dict) and isinstance(item.get("type"), str)
+        }
+
+    stop = {"the", "and", "for", "this", "that", "with", "when", "from"}
+
+    def tokens(name: str) -> set[str]:
+        path = skills_root / name / "SKILL.md"
+        if not path.is_file():
+            return set()
+        return {
+            value
+            for value in re.findall(r"[a-z][a-z0-9_-]{2,}", path.read_text().lower())
+            if value not in stop
+        }
+
+    candidates: list[dict[str, object]] = []
+    evidence_rows: list[dict[str, object]] = []
+    for candidate, row in sorted(rows.items()):
+        since = evaluated_timestamp(row)
+        candidate_tokens = tokens(candidate)
+        candidate_labels = labels(row)
+        observed = recalled = 0
+        if since is not None and metrics_database.is_file():
+            try:
+                with sqlite3.connect(metrics_database, timeout=30) as connection:
+                    result = connection.execute(
+                        "SELECT COUNT(*), COALESCE(SUM(recalled), 0) FROM ("
+                        "SELECT scope, MAX(recalled) AS recalled "
+                        "FROM skill_recall_observations "
+                        "WHERE skill = ? AND observed_at >= ? GROUP BY scope"
+                        ")",
+                        (
+                            candidate,
+                            datetime.fromtimestamp(since, UTC).isoformat(),
+                        ),
+                    ).fetchone()
+                observed, recalled = int(result[0]), int(result[1])
+            except sqlite3.OperationalError:
+                observed = recalled = 0
+        best: dict[str, object] | None = None
+        if candidate_tokens and candidate_labels:
+            for survivor, survivor_row in rows.items():
+                if survivor == candidate:
+                    continue
+                survivor_tokens = tokens(survivor)
+                survivor_labels = labels(survivor_row)
+                content = len(candidate_tokens & survivor_tokens) / len(candidate_tokens)
+                label_total = sum(candidate_labels.values())
+                label_covered = sum(
+                    min(weight, survivor_labels.get(name, 0.0))
+                    for name, weight in candidate_labels.items()
+                )
+                label_score = label_covered / label_total if label_total else 0.0
+                score = min(content, label_score)
+                if best is None or score > float(best["score"]):
+                    best = {
+                        "kind": "retirement",
+                        "operation_hint": "delete",
+                        "skills": [candidate, survivor],
+                        "delete_skill": candidate,
+                        "subsumed_by": survivor,
+                        "score": round(score, 6),
+                        "content_containment": round(content, 6),
+                        "label_containment": round(label_score, 6),
+                        "post_creation_scopes": observed,
+                        "recall_count": recalled,
+                        "reasons": ["post_creation_non_use", "capability_and_content_subsumed"],
+                        "decision": "review",
+                    }
+        blockers: list[str] = []
+        if since is None:
+            blockers.append("missing_evaluated_at")
+        if not candidate_tokens:
+            blockers.append("missing_skill_content")
+        if not candidate_labels:
+            blockers.append("missing_capability_labels")
+        if observed < min_post_creation_scopes:
+            blockers.append("insufficient_distinct_post_creation_scopes")
+        if recalled > max_recall_count:
+            blockers.append("recall_count_above_limit")
+        if best is None or float(best["content_containment"]) < min_content_containment:
+            blockers.append("content_not_subsumed")
+        if best is None or float(best["label_containment"]) < min_label_containment:
+            blockers.append("labels_not_subsumed")
+        eligible = not blockers
+        evidence_rows.append(
+            {
+                "skill": candidate,
+                "evaluated_at": (row.get("lifecycle") or {}).get("evaluated_at"),
+                "distinct_post_creation_scopes": observed,
+                "minimum_distinct_post_creation_scopes": min_post_creation_scopes,
+                "recalled_scope_count": recalled,
+                "maximum_recalled_scope_count": max_recall_count,
+                "best_subsumer": best.get("subsumed_by") if best else None,
+                "content_containment": best.get("content_containment") if best else 0.0,
+                "minimum_content_containment": min_content_containment,
+                "label_containment": best.get("label_containment") if best else 0.0,
+                "minimum_label_containment": min_label_containment,
+                "eligible": eligible,
+                "blockers": blockers,
+            }
+        )
+        if eligible and best is not None:
+            candidates.append(best)
+    atomic_write_json(
+        workspace / "run/inventory-retirement-evidence.json",
+        {
+            "schema_version": 1,
+            "policy": {
+                "minimum_distinct_post_creation_scopes": min_post_creation_scopes,
+                "maximum_recalled_scope_count": max_recall_count,
+                "minimum_content_containment": min_content_containment,
+                "minimum_label_containment": min_label_containment,
+            },
+            "skills": evidence_rows,
+        },
+    )
+    return candidates
+
+
+def materialize_inventory_findings(
+    workspace: Path, candidates: dict[str, object]
+) -> list[str]:
+    """Turn inventory candidates into auditable, trace-free evolution units."""
+    scopes: list[str] = []
+    for index, candidate in enumerate(candidates.get("candidates") or [], start=1):
+        if not isinstance(candidate, dict):
+            continue
+        skills = [str(value) for value in candidate.get("skills") or [] if value]
+        if len(skills) < 2:
+            continue
+        digest = hashlib.sha256("\0".join(skills).encode()).hexdigest()[:12]
+        scope = f"inventory-merge-{index:03d}-{digest}"
+        scopes.append(scope)
+        confidence = float(candidate.get("score") or 0)
+        skill_documents: dict[str, str] = {}
+        for name in skills:
+            skill_path = workspace / "target/to_be_improved_skills" / name / "SKILL.md"
+            if not skill_path.is_file():
+                skill_path = workspace / "target/to_be_improved_skills" / name / "skill.md"
+            if skill_path.is_file():
+                skill_documents[name] = skill_path.read_text()
+        retirement = candidate.get("kind") == "retirement"
+        summary = (
+            f"Review {candidate.get('delete_skill')} for retirement because "
+            f"{candidate.get('subsumed_by')} subsumes it after "
+            f"{candidate.get('post_creation_scopes')} post-creation scopes "
+            "without recall."
+            if retirement
+            else f"Review {', '.join(skills)} for consolidation or focused updates."
+        )
+        finding = {
+            "schema_version": 1,
+            "finding_id": scope,
+            "detector": "inventory-redundancy-v1",
+            "confidence": confidence,
+            "severity": "medium",
+            "summary": summary,
+            "features": {
+                "candidate_source": "inventory_maintenance",
+                "candidate_skills": skills,
+                "merge_candidate": candidate,
+                "skill_documents": skill_documents,
+                "distinct_sessions": int(candidate.get("distinct_sessions") or 0),
+                "trace_free": True,
+                "operation_hint": candidate.get("operation_hint"),
+                "delete_skill": candidate.get("delete_skill"),
+                "subsumed_by": candidate.get("subsumed_by"),
+            },
+            "evidence": [{
+                "kind": "skill_inventory",
+                "skills": skills,
+                "score": confidence,
+                "reasons": candidate.get("reasons") or [],
+            }],
+            "slice": {"turns": [], "user_turns": 0, "token_estimate": 0},
+        }
+        atomic_write_json(
+            workspace / "traces/derived/findings" / scope / "finding.json", finding
+        )
+        atomic_write_json(
+            workspace / "run" / scope / "diagnosis.json",
+            {
+                "skill_capabilities_missing": [{
+                    "skill_capability": "inventory/consolidation",
+                    "confidence": confidence,
+                    "reasoning": summary,
+                    "evidence_list": [
+                        "deterministic inventory overlap and methodology fingerprint analysis"
+                    ],
+                    "cluster": scope,
+                }],
+                "newly_detected_skill_capabilites_missing": [],
+                "inventory_maintenance": candidate,
+            },
+        )
+    atomic_write_json(
+        workspace / "run/inventory-maintenance-units.json",
+        {"schema_version": 1, "unit_count": len(scopes), "units": scopes},
+    )
+    return scopes
+
+
+def append_execution_event(workspace: Path, stage: str, event: str) -> None:
+    path = workspace / "logs/execution.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    row = {
+        "agent": AGENT_NUMBERS[stage],
+        "state": stage,
+        "event": event,
+        "at": datetime.now(UTC).isoformat(),
+    }
+    line = json.dumps(row, separators=(",", ":")) + "\n"
+    with _EXECUTION_LOG_LOCK:
+        with path.open("a") as stream:
+            stream.write(line)
+
+
+def run_session(
+    stage: str,
+    workspace: Path,
+    prompt: str,
+    auth: dict[str, str],
+    model: str | None,
+    install_agent: bool,
+    suffix: str,
+    metadata: dict[str, object] | None = None,
+    *,
+    json_output: bool = False,
+    input_root: Path | None = None,
+) -> Path:
+    reserve_agent_call(workspace, stage, suffix)
+    details: dict[str, object] = dict(metadata or {})
+    log_path = session_log_path(workspace, stage, suffix)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.with_suffix(".prompt.txt").write_text(prompt)
+    authoritative = metrics_workspace(workspace)
+    try:
+        details["session_log"] = log_path.relative_to(authoritative).as_posix()
+    except ValueError:
+        details["session_log"] = str(log_path)
+    details["prompt_chars"] = len(prompt)
+    write_status(workspace, stage, suffix, "started")
+    append_execution_event(workspace, stage, "started")
+    try:
+        with pipeline_metrics.span(
+            authoritative,
+            stage,
+            suffix,
+            "llm_agent",
+            backend=ACTIVE_BACKEND,
+            model=model,
+            metadata=details,
+        ):
+            try:
+                if ACTIVE_BACKEND == "docker-claude":
+                    run_docker_session(
+                        stage,
+                        workspace,
+                        prompt,
+                        auth,
+                        model,
+                        install_agent,
+                        suffix,
+                        log_path,
+                        details,
+                        json_output,
+                        input_root,
+                    )
+                else:
+                    run_host_session(
+                        ACTIVE_BACKEND,
+                        stage,
+                        workspace,
+                        prompt,
+                        model,
+                        suffix,
+                        log_path,
+                        details,
+                        json_output,
+                        input_root,
+                    )
+            finally:
+                details.update(session_counts(log_path))
+    except BaseException as error:
+        append_execution_event(workspace, stage, "failed")
+        write_status(
+            workspace, stage, suffix, "failed", error=failure_text(error)
+        )
+        raise
+    append_execution_event(workspace, stage, "done")
+    return log_path
+
+
+def write_status(
+    workspace: Path,
+    stage: str,
+    item: str,
+    state: str,
+    *,
+    outputs: list[Path] | None = None,
+    error: str | None = None,
+    skills: list[str] | None = None,
+) -> None:
+    safe_item = re.sub(r"[^a-zA-Z0-9_.-]+", "-", item).strip("-")
+    path = workspace / "run/status" / stage / f"{safe_item}.json"
+    # run_session and its enclosing scope can report the same failure from
+    # different worker threads. Serialize the read/merge/replace transaction
+    # so a late writer cannot resurrect an earlier `started` status.
+    with _STATUS_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        now = datetime.now(UTC)
+        previous: dict[str, object] = {}
+        if path.is_file():
+            try:
+                value = json.loads(path.read_text())
+                previous = value if isinstance(value, dict) else {}
+            except json.JSONDecodeError:
+                previous = {}
+        started_at = previous.get("started_at")
+        if (
+            not isinstance(started_at, str)
+            or state == "started" and previous.get("state") != "started"
+        ):
+            started_at = now.isoformat()
+        record: dict[str, object] = {
+            "stage": stage,
+            "item": item,
+            "state": state,
+            "at": now.isoformat(),
+            "started_at": started_at,
+        }
+        if state != "started":
+            try:
+                started = datetime.fromisoformat(started_at)
+                record["duration_ms"] = round(
+                    (now - started).total_seconds() * 1000
+                )
+            except ValueError:
+                pass
+        if outputs is not None:
+            record["outputs"] = [
+                str(output.relative_to(workspace)) for output in outputs
+            ]
+        if error:
+            record["error"] = error
+        if skills:
+            record["skills"] = [str(name) for name in skills if str(name).strip()]
+        elif isinstance(previous.get("skills"), list):
+            record["skills"] = previous["skills"]
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(record, indent=2, ensure_ascii=False) + "\n")
+        temporary.replace(path)
+
+
+def complete_session(
+    workspace: Path, stage: str, item: str, outputs: list[Path]
+) -> None:
+    write_status(workspace, stage, item, "done", outputs=outputs)
+
+
+def atomic_write_json(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(f"{path.suffix}.tmp")
+    temporary.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
+    temporary.replace(path)
+
+
+def safe_name(value: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_.-]+", "-", value).strip("-")
+
+
+def create_worker_workspace(
+    workspace: Path, stage: str, item: str
+) -> Path:
+    root = ROOT / ".pipeline-workers" / workspace.name / stage
+    worker = root / safe_name(item)
+    if worker.exists():
+        shutil.rmtree(worker)
+    worker.parent.mkdir(parents=True, exist_ok=True)
+
+    def ignore(directory: str, names: list[str]) -> set[str]:
+        ignored = {
+            name
+            for name in names
+            if name == "__pycache__"
+            or name == ".DS_Store"
+            or name.endswith(".pyc")
+            or name.endswith(".tmp")
+            or name.endswith(".sqlite-journal")
+            or name.endswith(".sqlite-wal")
+            or name.endswith(".sqlite-shm")
+        }
+        if Path(directory).resolve() == (workspace / "traces").resolve():
+            ignored.add("raw")
+        if Path(directory).resolve() == workspace.resolve():
+            # Held-out cases are never copied into an Optimize worker.
+            ignored.add("evaluation")
+        return ignored
+
+    shutil.copytree(
+        workspace,
+        worker,
+        symlinks=False,
+        ignore=ignore,
+    )
+    worker_log = worker / "logs/execution.jsonl"
+    if worker_log.exists():
+        worker_log.unlink()
+    return worker
+
+
+def remove_worker_workspace(worker: Path) -> None:
+    if worker.exists():
+        shutil.rmtree(worker)
+    root = ROOT / ".pipeline-workers"
+    for parent in (worker.parent, worker.parent.parent, worker.parent.parent.parent):
+        if parent == root.parent:
+            break
+        try:
+            parent.rmdir()
+        except OSError:
+            break
+
+
+def remove_worker_stage(workspace: Path, stage: str) -> None:
+    path = ROOT / ".pipeline-workers" / workspace.name / stage
+    if path.exists():
+        shutil.rmtree(path)
+
+
+def replace_path(source: Path, target: Path) -> None:
+    if target.is_symlink() or target.is_file():
+        target.unlink()
+    elif target.is_dir():
+        shutil.rmtree(target)
+    if source.is_dir():
+        shutil.copytree(source, target)
+    else:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+
+
+def merge_worker_log(worker: Path, workspace: Path) -> None:
+    source = worker / "logs/execution.jsonl"
+    if not source.is_file():
+        return
+    target = workspace / "logs/execution.jsonl"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("a") as output:
+        output.write(source.read_text())
+
+
+def run_pool(
+    items: list[object],
+    max_workers: int,
+    worker,
+) -> list[object]:
+    if max_workers < 1:
+        raise SystemExit("worker count must be at least 1")
+    if not items:
+        return []
+    results: list[object | None] = [None] * len(items)
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(items))) as pool:
+        futures: dict[Future, int] = {
+            pool.submit(worker, item): index for index, item in enumerate(items)
+        }
+        try:
+            for future in as_completed(futures):
+                results[futures[future]] = future.result()
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            raise
+    return [result for result in results if result is not None]
+
+
+def require_path(path: Path, description: str) -> None:
+    if not path.exists():
+        raise SystemExit(f"{description} was not produced: {path}")
+
+
+def cluster_names(workspace: Path, clustered: bool) -> list[str]:
+    if not clustered:
+        require_path(workspace / "traces/derived/cut", "cut traces")
+        return ["cut"]
+    root = workspace / "traces/derived/cluster"
+    require_path(root, "cluster directory")
+    names = sorted(path.name for path in root.iterdir() if path.is_dir())
+    if not names:
+        raise SystemExit(f"no cluster directories found under {root}")
+    return names
+
+
+def preprocessing_config() -> dict:
+    return json.loads(CONFIG_PATH.read_text())
+
+
+def include_infrastructure_failures(config: dict | None = None) -> bool:
+    config = preprocessing_config() if config is None else config
+    selection = ((config.get("signals") or {}).get("selection") or {})
+    return bool(selection.get("include_infrastructure_failures", False))
+
+
+def evolution_units(
+    workspace: Path, clustered: bool, unit_kind: str
+) -> list[str]:
+    if unit_kind == "finding":
+        root = workspace / "traces/derived/findings"
+        require_path(root, "selected findings")
+        names = sorted(path.name for path in root.iterdir() if path.is_dir())
+        return agent_scopes(workspace, names)
+    units = cluster_names(workspace, clustered)
+    if not clustered:
+        return units
+    return agent_scopes(workspace, units)
+
+
+def agent_scopes(workspace: Path, scopes: list[str]) -> list[str]:
+    return [
+        scope
+        for scope in scopes
+        if not infrastructure_evolution_blocked(workspace, scope)
+    ]
+
+
+def infrastructure_evolution_blocked(workspace: Path, scope: str) -> bool:
+    if include_infrastructure_failures():
+        return False
+    return scope_is_infrastructure_only(workspace, scope)
+
+
+def scope_is_infrastructure_only(workspace: Path, scope: str) -> bool:
+    if finding_is_infrastructure(workspace, scope):
+        return True
+    manifest = workspace / "traces/derived/cluster" / scope / "manifest.jsonl"
+    return manifest.is_file() and cluster_is_infrastructure_only(workspace, scope)
+
+
+def finding_is_infrastructure(workspace: Path, scope: str) -> bool:
+    path = workspace / "traces/derived/findings" / scope / "finding.json"
+    if not path.is_file():
+        return False
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return False
+    return isinstance(data, dict) and data.get("routing") == "infrastructure"
+
+
+def cluster_is_infrastructure_only(workspace: Path, cluster: str) -> bool:
+    manifest = workspace / "traces/derived/cluster" / cluster / "manifest.jsonl"
+    if not manifest.is_file():
+        return False
+    patterns = (preprocessing_config().get("signals") or {}).get(
+        "infrastructure_error_patterns", []
+    )
+    turns: list[dict[str, object]] = []
+    for line in manifest.read_text().splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        turn_path = row.get("turn_path")
+        if not isinstance(turn_path, str):
+            return False
+        path = workspace / turn_path
+        if not path.is_file():
+            return False
+        turns.append(json.loads(path.read_text()))
+    if not turns:
+        return False
+    return all(
+        pipeline_contracts.infrastructure_only_turn(turn, patterns)
+        for turn in turns
+    )
+
+
+INFRASTRUCTURE_REFUSAL = (
+    "infrastructure-only source excluded by "
+    "signals.selection.include_infrastructure_failures"
+)
+
+
+def created_skill_names(op: dict) -> list[str]:
+    if op.get("op") != "create":
+        return []
+    return skill_names_mod.skill_names(op)
+
+
+def drop_created_skills(workspace: Path, names: list[str]) -> None:
+    if not names:
+        return
+    removing = set(names)
+    for name in names:
+        for relative in (
+            Path("target/to_be_improved_skills") / name,
+            Path("target/raw_skills") / name,
+        ):
+            target = workspace / relative
+            if target.is_dir():
+                shutil.rmtree(target)
+            elif target.exists():
+                target.unlink()
+    metadata = workspace / "target/to_be_improved_skills_metadata/metadata.json"
+    improved = workspace / "target/to_be_improved_skills"
+    if not metadata.is_file():
+        return
+    data = json.loads(metadata.read_text())
+    rows = data.get("skills_metadata") or []
+    data["skills_metadata"] = [
+        row
+        for row in rows
+        if not (isinstance(row, dict) and row.get("skill") in removing)
+    ]
+    atomic_write_json(metadata, data)
+    if improved.is_dir():
+        current = skill_inventory_names(improved)
+        detach_skill_changelogs(workspace)
+        pipeline_contracts.validate_metadata(metadata, current)
+
+
+def write_publication(
+    workspace: Path,
+    cluster: str,
+    op_index: int,
+    *,
+    accepted: bool,
+    reason: str | None,
+    outcome: str | None = None,
+    selected_cluster: str | None = None,
+    selected_op_index: int | None = None,
+    release_id: str | None = None,
+    release_channel: str | None = None,
+) -> Path:
+    path = (
+        workspace
+        / "run"
+        / cluster
+        / "ops"
+        / str(op_index)
+        / "publication.json"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    publication: dict[str, object] = {
+        "schema_version": 1,
+        "accepted": accepted,
+        "reason": reason,
+        "outcome": outcome or ("accepted" if accepted else "rejected"),
+    }
+    if selected_cluster is not None and selected_op_index is not None:
+        publication["selected_operation"] = {
+            "cluster": selected_cluster,
+            "op_index": selected_op_index,
+        }
+    if release_id is not None:
+        publication["release"] = {
+            "release_id": release_id,
+            "channel": release_channel,
+        }
+    atomic_write_json(path, publication)
+    return path
+
+
+def goal_operation_rows(workspace: Path, cluster: str) -> list[dict]:
+    path = workspace / "run" / cluster / "evolve-goal.json"
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, dict):
+        return []
+    ops = (data.get("action") or {}).get("ops")
+    if not isinstance(ops, list):
+        return []
+    return [op for op in ops if isinstance(op, dict)]
+
+
+def refuse_infrastructure_scope(workspace: Path, cluster: str) -> None:
+    """Drop created skills from an infrastructure-only scope before acceptance."""
+    for op_index, op in enumerate(goal_operation_rows(workspace, cluster), start=1):
+        drop_created_skills(workspace, created_skill_names(op))
+        write_publication(
+            workspace,
+            cluster,
+            op_index,
+            accepted=False,
+            reason=INFRASTRUCTURE_REFUSAL,
+        )
+
+
+def refuse_blocked_scopes(
+    workspace: Path, clustered: bool, unit_kind: str
+) -> None:
+    if include_infrastructure_failures():
+        return
+    if unit_kind == "finding":
+        root = workspace / "traces/derived/findings"
+        names = (
+            sorted(path.name for path in root.iterdir() if path.is_dir())
+            if root.is_dir()
+            else []
+        )
+    elif clustered:
+        root = workspace / "traces/derived/cluster"
+        names = (
+            sorted(path.name for path in root.iterdir() if path.is_dir())
+            if root.is_dir()
+            else []
+        )
+    else:
+        return
+    for name in names:
+        if scope_is_infrastructure_only(workspace, name):
+            refuse_infrastructure_scope(workspace, name)
+
+
+def scope_source(cluster: str, clustered: bool, unit_kind: str) -> str:
+    if unit_kind == "finding":
+        return f"workspace/traces/derived/findings/{cluster}"
+    return (
+        f"workspace/traces/derived/cluster/{cluster}"
+        if clustered
+        else "workspace/traces/derived/cut"
+    )
+
+
+def scope_source_path(workspace: Path, source: str) -> Path:
+    """Resolve a prompt-facing ``workspace/...`` reference inside a run root."""
+    return workspace / source.removeprefix("workspace/")
+
+
+def validate_preprocessing(workspace: Path, clustered: bool) -> list[Path]:
+    normalized = workspace / "traces/derived/normalized"
+    manifest_path = normalized / "manifest.json"
+    require_path(manifest_path, "normalization manifest")
+    manifest = json.loads(manifest_path.read_text())
+    expected = set(manifest.get("eligible_trace_ids") or [])
+    if not expected:
+        raise SystemExit("normalization produced no eligible traces")
+    turns = normalized / "turns"
+    turn_ids: set[str] = set()
+    for path in turns.glob("*.json"):
+        data = pipeline_contracts.validate_canonical_turn(path)
+        trace_id = data["trace_id"]
+        if trace_id in turn_ids:
+            raise SystemExit(f"duplicate canonical trace ID: {trace_id}")
+        turn_ids.add(trace_id)
+        trajectory_relative = data.get("task_trajectory_path")
+        if not isinstance(trajectory_relative, str) or not trajectory_relative:
+            raise SystemExit(f"canonical turn has no task trajectory: {path}")
+        trajectory_path = workspace / trajectory_relative
+        pipeline_contracts.validate_task_trajectory(trajectory_path, trace_id)
+    if turn_ids != expected:
+        raise SystemExit("canonical turns do not match normalization manifest")
+    cut = workspace / "traces/derived/cut"
+    cut_ids = pipeline_contracts.validate_cluster_manifest(
+        cut / "manifest.jsonl", "cut", turns
+    )
+    if cut_ids != expected:
+        raise SystemExit("cut manifest does not cover every canonical trace")
+    features = workspace / "traces/derived/features"
+    require_path(features / "trace-features.jsonl", "trace features")
+    pipeline_contracts.validate_dedup_manifest(
+        features / "dedup-manifest.jsonl", expected
+    )
+    signals = workspace / "traces/derived/signals"
+    signal_ids = pipeline_contracts.validate_signal_findings(
+        signals / "findings.jsonl", expected
+    )
+    pipeline_contracts.validate_signal_patterns(
+        signals / "patterns.jsonl", signal_ids
+    )
+    selected_ids = pipeline_contracts.validate_selected_findings(
+        signals / "selected-manifest.jsonl", signal_ids, expected
+    )
+    pipeline_contracts.validate_selection_decisions(
+        signals / "selection-decisions.jsonl", signal_ids, selected_ids
+    )
+    findings = workspace / "traces/derived/findings"
+    require_path(findings, "selected finding directory")
+    finding_dirs = sorted(path for path in findings.iterdir() if path.is_dir())
+    if {path.name for path in finding_dirs} != selected_ids:
+        raise SystemExit("selected finding manifest does not match finding directories")
+    for directory in finding_dirs:
+        finding_ids = pipeline_contracts.validate_cluster_manifest(
+            directory / "manifest.jsonl", directory.name, turns
+        )
+        finding_path = directory / "finding.json"
+        require_path(finding_path, "finding details")
+        finding = json.loads(finding_path.read_text())
+        if finding.get("signal_id") != directory.name:
+            raise SystemExit(f"finding ID does not match directory: {finding_path}")
+        if finding_ids != set(finding.get("trace_ids") or []):
+            raise SystemExit(
+                f"finding manifest does not cover its evidence: {directory}"
+            )
+    outputs = [normalized, cut, features, signals, findings]
+    if clustered:
+        cluster_root = workspace / "traces/derived/cluster"
+        require_path(cluster_root, "cluster directory")
+        covered: set[str] = set()
+        for directory in sorted(path for path in cluster_root.iterdir() if path.is_dir()):
+            covered.update(
+                pipeline_contracts.validate_cluster_manifest(
+                    directory / "manifest.jsonl", directory.name, turns
+                )
+            )
+            pipeline_contracts.validate_cluster_manifest(
+                directory / "representatives.jsonl", directory.name, turns
+            )
+        if covered != expected:
+            raise SystemExit(
+                "cluster manifests must cover every canonical trace"
+            )
+        outputs.append(cluster_root)
+    return outputs
+
+
+def goal_ops(goal: Path) -> list[dict]:
+    data = pipeline_contracts.validate_goal(goal)
+    ops = (data.get("action") or {}).get("ops")
+    return ops
+
+
+QUALITY_TOKEN = re.compile(r"[A-Za-z0-9_]+")
+
+
+def _quality_words(value: object) -> set[str]:
+    if isinstance(value, str):
+        return {token.casefold() for token in QUALITY_TOKEN.findall(value)}
+    if isinstance(value, dict):
+        return set().union(
+            *(_quality_words(item) for item in value.values()),
+            set(),
+        )
+    if isinstance(value, list):
+        return set().union(*(_quality_words(item) for item in value), set())
+    return set()
+
+
+def _maximum_existing_skill_similarity(workspace: Path, op: dict) -> float:
+    proposed = _quality_words(op)
+    if len(proposed) < 8:
+        return 0.0
+    maximum = 0.0
+    roots = (
+        workspace / "target/raw_skills",
+        workspace / "target/to_be_improved_skills",
+    )
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for path in root.glob("*/SKILL.md"):
+            existing = _quality_words(path.read_text(errors="replace"))
+            union = proposed | existing
+            if union:
+                maximum = max(maximum, len(proposed & existing) / len(union))
+    return maximum
+
+
+def enforce_creation_policy(
+    workspace: Path, cluster: str, goal: dict, op: dict
+) -> None:
+    finding_path = (
+        workspace / "traces" / "derived" / "findings" / cluster / "finding.json"
+    )
+    if not finding_path.is_file():
+        return
+    config = json.loads((ROOT / "common/preprocessing-config.json").read_text())
+    policy = config.get("evolution_policy") or {}
+    finding = json.loads(finding_path.read_text())
+    features = finding.get("features") or {}
+    source = features.get("candidate_source")
+    if source in {"methodology", "methodology_consolidated"}:
+        quality = features.get("quality") or {}
+        value = float(quality.get("value") or 0)
+        minimum_value = float(policy.get("min_methodology_value", 0.08))
+        if value < minimum_value:
+            raise pipeline_contracts.ContractError(
+                f"{cluster} proposes methodology below the utility gate: "
+                f"value={value}, minimum={minimum_value}"
+            )
+        methodology_policy = config.get("methodology") or {}
+        obviousness = float(quality.get("obviousness") or 0)
+        task_specificity = float(quality.get("task_specificity") or 0)
+        if obviousness > float(
+            methodology_policy.get("max_obviousness", 0.55)
+        ):
+            raise pipeline_contracts.ContractError(
+                f"{cluster} proposes obvious methodology: "
+                f"obviousness={obviousness}"
+            )
+        if task_specificity > float(
+            methodology_policy.get("max_task_specificity", 0.65)
+        ):
+            raise pipeline_contracts.ContractError(
+                f"{cluster} proposes task-specific methodology: "
+                f"task_specificity={task_specificity}"
+            )
+        similarity = _maximum_existing_skill_similarity(workspace, op)
+        maximum_similarity = float(
+            policy.get("novelty_max_similarity", 0.82)
+        )
+        if similarity > maximum_similarity:
+            raise pipeline_contracts.ContractError(
+                f"{cluster} proposes methodology already covered by a skill: "
+                f"similarity={similarity:.3f}, maximum={maximum_similarity}"
+            )
+    if op.get("op") != "create":
+        return
+    evidence = finding.get("evidence") or []
+    distinct_session_count = int(features.get("distinct_sessions") or 0)
+    sessions = {
+        value for value in [finding.get("session_id")]
+        if isinstance(value, str) and value
+    }
+    distinct_session_count = max(distinct_session_count, len(sessions))
+    diagnosis_path = workspace / "run" / cluster / "diagnosis.json"
+    diagnosis = json.loads(diagnosis_path.read_text())
+    is_ood = bool(diagnosis.get("newly_detected_skill_capabilites_missing"))
+    confidence = float(finding.get("confidence") or 0)
+    enough_evidence = len(evidence) >= int(
+        policy.get("create_min_evidence_records", 2)
+    )
+    enough_confidence = confidence >= float(
+        policy.get("create_min_confidence", 0.75)
+    )
+    enough_sessions = distinct_session_count >= int(
+        policy.get("create_min_distinct_sessions", 2)
+    )
+    single_session_allowed = bool(policy.get("allow_single_session_create"))
+    pattern_confidence = float(
+        policy.get(
+            "single_session_pattern_min_confidence",
+            policy.get("create_min_confidence", 0.75),
+        )
+    )
+    pattern_windows = int(features.get("distinct_windows") or 0)
+    repeated_pattern_allowed = (
+        bool(policy.get("allow_single_session_repeated_pattern_create"))
+        and features.get("candidate_source") == "cut_pattern"
+        and confidence >= pattern_confidence
+        and pattern_windows
+        >= int(policy.get("single_session_pattern_min_distinct_windows", 3))
+    )
+    resource = str(features.get("resource") or "")
+    resource_contract_key = {
+        "scripts": "script_contract",
+        "references": "reference_contract",
+        "assets": "asset_contract",
+        "agents": "agent_contract",
+        "evals": "eval_contract",
+    }.get(resource)
+    required_resource_guards = {
+        "repeated-independent-invocations",
+        "explicit-resource-shape",
+        "stable-normalized-fingerprint",
+    }
+    resource_guards = {
+        str(item)
+        for item in (features.get("false_positive_guards") or [])
+        if isinstance(item, str)
+    }
+    resource_opportunity_allowed = (
+        bool(policy.get("allow_single_session_resource_create", True))
+        and source == "resource_opportunity"
+        and features.get("resource_decision") == "use"
+        and resource_contract_key is not None
+        and isinstance(features.get(resource_contract_key), dict)
+        and bool(features.get(resource_contract_key))
+        and not bool(features.get("equivalent_resource_exists"))
+        and required_resource_guards <= resource_guards
+        and confidence
+        >= float(policy.get("single_session_resource_min_confidence", 0.9))
+        and pattern_windows
+        >= int(policy.get("single_session_resource_min_distinct_windows", 3))
+        and int(features.get("occurrence_count") or 0)
+        >= int(policy.get("single_session_resource_min_occurrences", 3))
+    )
+    authored_resource_allowed = (
+        bool(policy.get("allow_single_session_authored_resource_create", True))
+        and source == "resource_opportunity"
+        and features.get("resource_evidence_mode") == "authored_lifecycle"
+        and features.get("resource_decision") == "use"
+        and resource_contract_key is not None
+        and isinstance(features.get(resource_contract_key), dict)
+        and bool(features.get(resource_contract_key))
+        and not bool(features.get("equivalent_resource_exists"))
+        and required_resource_guards <= resource_guards
+        and "successful-post-authoring-validation" in resource_guards
+        and confidence >= float(
+            policy.get("single_session_authored_resource_min_confidence", 0.9)
+        )
+        and int(features.get("distinct_lifecycle_stages") or 0)
+        >= int(policy.get("single_session_authored_resource_min_lifecycle_stages", 3))
+    )
+    ood_override = (
+        is_ood and bool(policy.get("allow_single_session_ood_create", True))
+    )
+    methodology_allowed = (
+        source in {"methodology", "methodology_consolidated"}
+        and bool(policy.get("allow_single_session_methodology_create", False))
+        and confidence
+        >= float(policy.get("single_session_methodology_min_confidence", 0.82))
+        and float((features.get("quality") or {}).get("value") or 0)
+        >= float(policy.get("single_session_methodology_min_value", 0.18))
+    )
+    if (
+        enough_evidence or methodology_allowed or resource_opportunity_allowed or authored_resource_allowed
+    ) and enough_confidence and (
+        enough_sessions
+        or single_session_allowed
+        or repeated_pattern_allowed
+        or resource_opportunity_allowed
+        or authored_resource_allowed
+        or ood_override
+        or methodology_allowed
+    ):
+        return
+    raise pipeline_contracts.ContractError(
+        f"{cluster} proposes create without sufficient recurrence: "
+        f"confidence={confidence}, evidence_records={len(evidence)}, "
+        f"distinct_sessions={distinct_session_count}, "
+        f"distinct_windows={pattern_windows}, "
+        f"repeated_pattern={repeated_pattern_allowed}, "
+        f"resource_opportunity={resource_opportunity_allowed}, "
+        f"authored_resource={authored_resource_allowed}, "
+        f"methodology={methodology_allowed}, ood={is_ood}. Goal "
+        "should use no_change or update an existing skill."
+    )
+
+
+def materialize_op_goal(
+    workspace: Path,
+    cluster: str,
+    op_index: int,
+    goal: dict,
+    op: dict,
+    *,
+    activate: bool = True,
+) -> Path:
+    narrowed = copy.deepcopy(goal)
+    narrowed["action"]["ops"] = [copy.deepcopy(op)]
+    path = workspace / "run" / cluster / "ops" / str(op_index) / "evolve-goal.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(narrowed, indent=2, ensure_ascii=False) + "\n")
+    pipeline_contracts.validate_goal(path, exactly_one_op=True)
+    if activate:
+        shutil.copy2(path, workspace / "run/evolve-goal.json")
+    return path
+
+
+def materialize_created_skill_metadata(
+    workspace: Path,
+    op: dict,
+    cluster: str | None = None,
+    run_id: str | None = None,
+) -> None:
+    """Materialize metadata for create and new-target merge operations."""
+    operation = op.get("op")
+    if operation not in {"create", "merge"}:
+        return
+    path = workspace / "target/to_be_improved_skills_metadata/metadata.json"
+    try:
+        document = json.loads(path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        document = {"skills_metadata": []}
+    rows = document.get("skills_metadata")
+    if not isinstance(rows, list):
+        rows = []
+    by_name = {
+        row.get("skill"): row
+        for row in rows
+        if isinstance(row, dict)
+        and isinstance(row.get("skill"), str)
+        and row["skill"]
+    }
+    skill_specs = list(op.get("skills") or []) if operation == "create" else []
+    if operation == "merge":
+        into = op.get("into") or {}
+        target = into.get("skill") if isinstance(into, dict) else None
+        if isinstance(target, str) and target and target not in by_name:
+            label_weights: dict[str, float] = {}
+            for source in op.get("skills") or []:
+                row = by_name.get(source)
+                if not isinstance(row, dict):
+                    continue
+                for label in row.get("skill_types") or []:
+                    if not isinstance(label, dict) or not isinstance(label.get("type"), str):
+                        continue
+                    name = str(label["type"])
+                    label_weights[name] = max(
+                        label_weights.get(name, 0.0), float(label.get("weight") or 0)
+                    )
+            skill_specs = [{
+                "skill": target,
+                "description": str(into.get("description") or ""),
+                "labels": [
+                    {"type": name, "weight": weight}
+                    for name, weight in sorted(label_weights.items())
+                ],
+            }]
+    lifecycle: dict[str, object] | None = None
+    if cluster:
+        finding_path = (
+            workspace
+            / "traces"
+            / "derived"
+            / "findings"
+            / cluster
+            / "finding.json"
+        )
+        if finding_path.is_file():
+            finding = json.loads(finding_path.read_text())
+            features = finding.get("features") or {}
+            session_ids = {
+                value
+                for value in [finding.get("session_id")]
+                if isinstance(value, str) and value
+            }
+            distinct_sessions = max(
+                len(session_ids),
+                int(features.get("distinct_sessions") or 0),
+            )
+            policy = preprocessing_config().get("evolution_policy") or {}
+            minimum_sessions = int(
+                policy.get("create_min_distinct_sessions", 2)
+            )
+            selection_path = workspace / "run/trace-selection.json"
+            selection = (
+                json.loads(selection_path.read_text())
+                if selection_path.is_file()
+                else {}
+            )
+            lifecycle = {
+                "status": (
+                    str(
+                        policy.get(
+                            "single_session_create_lifecycle",
+                            "provisional",
+                        )
+                    )
+                    if distinct_sessions < minimum_sessions
+                    else "stable"
+                ),
+                "origin_run_id": selection.get("run_id") or workspace.name,
+                "origin_finding_id": cluster,
+                "origin_session_ids": sorted(session_ids),
+                "distinct_sessions": distinct_sessions,
+                "confidence": float(finding.get("confidence") or 0),
+                "evidence_records": len(finding.get("evidence") or []),
+                "distinct_windows": int(
+                    features.get("distinct_windows") or 0
+                ),
+            }
+            if features.get("candidate_source") in {
+                "methodology",
+                "methodology_consolidated",
+            }:
+                lifecycle["method_fingerprint"] = features.get(
+                    "method_fingerprint"
+                )
+                lifecycle["methodology_value"] = float(
+                    (features.get("quality") or {}).get("value") or 0
+                )
+            if selection.get("seeded_from"):
+                lifecycle["seeded_from"] = selection["seeded_from"]
+    if operation == "merge" and lifecycle is not None:
+        source_session_ids = {
+            session_id
+            for source in op.get("skills") or []
+            for session_id in (
+                (by_name.get(source) or {}).get("lifecycle") or {}
+            ).get("origin_session_ids", [])
+            if isinstance(session_id, str) and session_id
+        }
+        if source_session_ids:
+            lifecycle["origin_session_ids"] = sorted(source_session_ids)
+            lifecycle["distinct_sessions"] = max(
+                int(lifecycle.get("distinct_sessions") or 0),
+                len(source_session_ids),
+            )
+    for skill in skill_specs:
+        if not isinstance(skill, dict):
+            continue
+        name = skill.get("skill")
+        if not isinstance(name, str) or not name:
+            continue
+        labels = [
+            dict(label)
+            for label in skill.get("labels") or []
+            if isinstance(label, dict)
+        ]
+        existing = by_name.get(name)
+        row = {
+            "skill": name,
+            "description": str(skill.get("description") or ""),
+            "skill_types": labels,
+            "unmatched_skill_types": [],
+        }
+        carried = (
+            existing.get("changelog")
+            if isinstance(existing, dict)
+            else None
+        )
+        if isinstance(carried, list):
+            append_changelog_lines(
+                workspace / SKILL_CHANGELOG_DIR,
+                name,
+                lines_from_history(carried),
+            )
+        phase_lines = []
+        for entry in skill_phase_entries(workspace, name, run_id):
+            if entry.get("phase") == "verification":
+                continue
+            line = _phase_line(entry)
+            if line:
+                phase_lines.append(line)
+        append_changelog_lines(
+            workspace / SKILL_CHANGELOG_DIR, name, phase_lines
+        )
+        for field in ("dependencies", "sources"):
+            value = skill.get(field)
+            if value is None and isinstance(existing, dict):
+                value = existing.get(field)
+            if isinstance(value, list):
+                row[field] = copy.deepcopy(value)
+        if lifecycle is not None:
+            row["lifecycle"] = lifecycle
+        by_name[name] = row
+    for name, row in by_name.items():
+        if not isinstance(row, dict) or "changelog" not in row:
+            continue
+        history = row.pop("changelog")
+        if isinstance(name, str) and isinstance(history, list):
+            append_changelog_lines(
+                workspace / SKILL_CHANGELOG_DIR,
+                name,
+                lines_from_history(history),
+            )
+    atomic_write_json(
+        path,
+        {
+            "skills_metadata": [
+                by_name[name] for name in sorted(by_name)
+            ]
+        },
+    )
+
+
+def validate_optimized_op(workspace: Path, op: dict) -> list[Path]:
+    improved = workspace / "target/to_be_improved_skills"
+    raw = workspace / "target/raw_skills"
+    name = op.get("op")
+    expected: list[str] = []
+    removed: list[str] = []
+    snapshot: list[str] = []
+    if name in {"create", "update", "delete"}:
+        source_rows = op.get("skills") or []
+        skill_names = [
+            row.get("skill")
+            for row in source_rows
+            if isinstance(row, dict) and isinstance(row.get("skill"), str)
+        ]
+        if name == "create":
+            expected = skill_names
+        elif name == "update":
+            expected = skill_names
+            snapshot = skill_names
+        else:
+            removed = skill_names
+            snapshot = skill_names
+    elif name == "merge":
+        source_names = [value for value in op.get("skills") or [] if isinstance(value, str)]
+        target = (op.get("into") or {}).get("skill")
+        expected = [target] if isinstance(target, str) else []
+        removed = [value for value in source_names if value not in expected]
+        snapshot = source_names
+    elif name == "split":
+        source = op.get("skill")
+        expected = [
+            row.get("skill")
+            for row in op.get("into") or []
+            if isinstance(row, dict) and isinstance(row.get("skill"), str)
+        ]
+        if isinstance(source, str):
+            snapshot = [source]
+            if source not in expected:
+                removed = [source]
+    for skill in expected:
+        if not (improved / skill).is_dir():
+            raise SystemExit(f"optimized skill was not produced: {skill}")
+        if name == "create":
+            problems = skill_format_checker.validate_authored_skill(
+                improved / skill
+            )
+            if problems:
+                raise SystemExit(
+                    f"invalid created skill {skill}: " + "; ".join(problems)
+                )
+        evals = improved / skill / "evals/evals.json"
+        if evals.is_file():
+            eval_problems = skill_evaluation.validate_evals_file(evals, skill)
+            if eval_problems:
+                raise SystemExit(
+                    f"invalid evals for {skill}: " + "; ".join(eval_problems)
+                )
+        if name == "update":
+            row = next(
+                (
+                    item
+                    for item in source_rows
+                    if isinstance(item, dict) and item.get("skill") == skill
+                ),
+                {},
+            )
+            if row.get("sections") and row.get("resource_plan") is not None:
+                raw_evals = raw / skill / "evals/evals.json"
+                if not evals.is_file():
+                    raise SystemExit(
+                        f"behavioral update did not produce evals for {skill}"
+                    )
+                if raw_evals.is_file() and raw_evals.read_bytes() == evals.read_bytes():
+                    raise SystemExit(
+                        f"behavioral update did not change evals for {skill}"
+                    )
+    for skill in removed:
+        if (improved / skill).exists():
+            raise SystemExit(f"removed skill still exists after {name}: {skill}")
+    for skill in snapshot:
+        if not (raw / skill).is_dir():
+            raise SystemExit(f"raw skill snapshot was not produced: {skill}")
+    validate_planned_resource_outputs(workspace, op)
+    preservation = validate_inherited_resources(workspace, op)
+    atomic_write_json(
+        workspace / "target/resource-preservation.json", preservation
+    )
+    current = skill_inventory_names(improved)
+    metadata = workspace / "target/to_be_improved_skills_metadata/metadata.json"
+    detach_skill_changelogs(workspace)
+    pipeline_contracts.validate_metadata(metadata, current)
+    return [improved, raw, metadata]
+
+
+def _resource_files(skill_dir: Path) -> dict[str, list[Path]]:
+    """Return authored supporting files, excluding generated interface metadata."""
+    result: dict[str, list[Path]] = {}
+    if not skill_dir.is_dir():
+        return result
+    for kind in pipeline_contracts.RESOURCE_KINDS:
+        root = skill_dir / kind
+        if not root.is_dir():
+            continue
+        files = [
+            path.relative_to(skill_dir)
+            for path in sorted(root.rglob("*"))
+            if path.is_file()
+            and "__pycache__" not in path.relative_to(skill_dir).parts
+            and path.suffix != ".pyc"
+            and path.name != ".DS_Store"
+            and not (kind == "agents" and path.relative_to(skill_dir).as_posix() == "agents/openai.yaml")
+        ]
+        if files:
+            result[kind] = files
+    return result
+
+
+def remove_transient_skill_artifacts(skill_dir: Path) -> None:
+    """Remove interpreter/editor byproducts before validation and publication."""
+    if not skill_dir.is_dir():
+        return
+    for path in sorted(skill_dir.rglob("*"), reverse=True):
+        if path.is_file() and (path.suffix == ".pyc" or path.name == ".DS_Store"):
+            path.unlink()
+        elif path.is_dir() and path.name == "__pycache__":
+            shutil.rmtree(path)
+
+
+def validate_planned_resource_outputs(workspace: Path, op: dict) -> None:
+    """Enforce each positive resource decision against the authored output.
+
+    Resource-plan rows are not decorative feature flags. A ``use`` decision
+    must produce at least one authored file, and the main instructions must
+    make every non-eval resource discoverable. Python helpers must compile.
+    """
+    kind = op.get("op")
+    if kind in {"create", "update"}:
+        records = op.get("skills") or []
+    elif kind == "merge":
+        records = [op.get("into")]
+    elif kind == "split":
+        records = op.get("into") or []
+    else:
+        return
+    root = workspace / "target/to_be_improved_skills"
+    for record in records:
+        if not isinstance(record, dict) or not isinstance(record.get("skill"), str):
+            continue
+        plan = record.get("resource_plan")
+        if not isinstance(plan, list):
+            continue
+        skill = root / str(record["skill"])
+        resources = _resource_files(skill)
+        skill_text = (skill / "SKILL.md").read_text(errors="replace")
+        for row in plan:
+            if not isinstance(row, dict) or row.get("decision") != "use":
+                continue
+            resource = str(row.get("resource") or "")
+            files = resources.get(resource, [])
+            if not files:
+                raise SystemExit(
+                    f"planned {resource} resource produced no authored file for {record['skill']}"
+                )
+            if resource != "evals":
+                undiscoverable = [
+                    path.as_posix()
+                    for path in files
+                    if path.as_posix() not in skill_text and path.name not in skill_text
+                ]
+                if undiscoverable:
+                    raise SystemExit(
+                        f"planned {resource} resource is not discoverable from SKILL.md "
+                        f"for {record['skill']}: {', '.join(undiscoverable)}"
+                    )
+            if resource == "scripts":
+                for relative in files:
+                    if relative.suffix != ".py":
+                        continue
+                    result = subprocess.run(
+                        [sys.executable, "-m", "py_compile", str(skill / relative)],
+                        capture_output=True,
+                        text=True,
+                    )
+                    if result.returncode != 0:
+                        raise SystemExit(
+                            f"planned Python script does not compile for {record['skill']}: "
+                            f"{relative.as_posix()}"
+                        )
+
+
+def reconcile_inherited_resource_plan(workspace: Path, op: dict) -> bool:
+    """Make inherited resources explicit before Optimize sees the operation.
+
+    An ``omit`` decision means no new resource capability. It never silently
+    authorizes dropping a resource already present on an update or merge
+    source. Explicit ``remove`` entries remain the only removal mechanism.
+    """
+    kind = op.get("op")
+    records: list[dict[str, object]] = []
+    sources: list[str] = []
+    changed = False
+    if kind == "update":
+        records = [row for row in op.get("skills") or [] if isinstance(row, dict)]
+    elif kind == "merge":
+        into = op.get("into")
+        if isinstance(into, dict):
+            # Some otherwise-valid model outputs attach the result's plan to
+            # the merge operation. Normalize that unambiguous shape before
+            # enforcing the result-record contract.
+            if not into.get("resource_plan") and isinstance(
+                op.get("resource_plan"), list
+            ) and op.get("resource_plan"):
+                into["resource_plan"] = op.pop("resource_plan")
+                changed = True
+            records = [into]
+        sources = [name for name in op.get("skills") or [] if isinstance(name, str)]
+    else:
+        return False
+    root = workspace / "target/to_be_improved_skills"
+    for record in records:
+        record_sources = sources or [str(record.get("skill") or "")]
+        inherited: dict[str, list[str]] = {}
+        for source in record_sources:
+            for resource, paths in _resource_files(root / source).items():
+                inherited.setdefault(resource, []).extend(
+                    path.as_posix() for path in paths
+                )
+        if not inherited:
+            continue
+        dirs = record.setdefault("dirs", [])
+        plan = record.setdefault("resource_plan", [])
+        planned_kinds = {
+            row.get("resource")
+            for row in plan
+            if isinstance(row, dict) and isinstance(row.get("resource"), str)
+        }
+        for resource in sorted(pipeline_contracts.RESOURCE_KINDS - planned_kinds):
+            plan.append(
+                {
+                    "resource": resource,
+                    "decision": "omit",
+                    "reason": (
+                        "No new resource of this kind was requested; inherited "
+                        "resources are reconciled separately."
+                    ),
+                    "confidence": 1.0,
+                }
+            )
+            changed = True
+        by_resource = {
+            row.get("resource"): row
+            for row in plan
+            if isinstance(row, dict) and isinstance(row.get("resource"), str)
+        }
+        for resource, paths in sorted(inherited.items()):
+            unique_paths = sorted(set(paths))
+            if not any(
+                isinstance(row, dict) and row.get("dir") == resource
+                for row in dirs
+            ):
+                dirs.append(
+                    {
+                        "dir": resource,
+                        "goal": (
+                            "Preserve and reconcile inherited resource files: "
+                            + ", ".join(unique_paths)
+                            + ". Do not drop existing behavior without an explicit remove item."
+                        ),
+                    }
+                )
+                changed = True
+            row = by_resource.get(resource)
+            if isinstance(row, dict) and row.get("decision") != "use":
+                row["decision"] = "use"
+                row["reason"] = (
+                    "Inherited from the active update or merge sources and must be "
+                    "preserved or reconciled: " + ", ".join(unique_paths)
+                )
+                row["confidence"] = 1.0
+                changed = True
+    return changed
+
+
+def validate_inherited_resources(workspace: Path, op: dict) -> dict[str, object]:
+    """Reject silent resource loss and return auditable preservation metrics."""
+    kind = op.get("op")
+    raw = workspace / "target/raw_skills"
+    improved = workspace / "target/to_be_improved_skills"
+    targets: list[tuple[dict[str, object], list[str]]] = []
+    if kind == "update":
+        for row in op.get("skills") or []:
+            if isinstance(row, dict) and isinstance(row.get("skill"), str):
+                targets.append((row, [str(row["skill"])]))
+    elif kind == "merge":
+        into = op.get("into")
+        if isinstance(into, dict) and isinstance(into.get("skill"), str):
+            targets.append(
+                (into, [name for name in op.get("skills") or [] if isinstance(name, str)])
+            )
+    else:
+        return {
+            "applicable": False,
+            "inherited_files": 0,
+            "preserved_files": 0,
+            "explicitly_removed_files": 0,
+            "inherited_eval_cases": 0,
+            "preserved_eval_cases": 0,
+            "revised_eval_cases": 0,
+            "missing": [],
+        }
+
+    report: dict[str, object] = {
+        "applicable": True,
+        "inherited_files": 0,
+        "preserved_files": 0,
+        "explicitly_removed_files": 0,
+        "inherited_eval_cases": 0,
+        "preserved_eval_cases": 0,
+        "revised_eval_cases": 0,
+        "missing": [],
+    }
+
+    def eval_cases(path: Path) -> list[dict[str, object]]:
+        if not path.is_file():
+            return []
+        try:
+            rows = json.loads(path.read_text()).get("evals") or []
+        except (json.JSONDecodeError, OSError):
+            return []
+        return [row for row in rows if isinstance(row, dict)]
+
+    def eval_signature(row: dict[str, object]) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                {
+                    "prompt": row.get("prompt"),
+                    "expected_output": row.get("expected_output"),
+                    "expectations": row.get("expectations"),
+                },
+                sort_keys=True,
+                ensure_ascii=False,
+            ).encode()
+        ).hexdigest()
+
+    for record, sources in targets:
+        target = improved / str(record["skill"])
+        removals = "\n".join(
+            item for item in record.get("remove") or [] if isinstance(item, str)
+        )
+        source_resources = {
+            source: _resource_files(raw / source) for source in sources
+        }
+        for source, resources in source_resources.items():
+            for resource, paths in resources.items():
+                if resource == "evals":
+                    expected_rows = eval_cases(raw / source / "evals/evals.json")
+                    actual_rows = eval_cases(target / "evals/evals.json")
+                    if kind == "update" and all(
+                        isinstance(row.get("id"), (str, int))
+                        for row in expected_rows + actual_rows
+                    ):
+                        expected = {f"id:{row['id']}" for row in expected_rows}
+                        actual = {f"id:{row['id']}" for row in actual_rows}
+                        expected_content = {
+                            f"id:{row['id']}": eval_signature(row)
+                            for row in expected_rows
+                        }
+                        actual_content = {
+                            f"id:{row['id']}": eval_signature(row)
+                            for row in actual_rows
+                        }
+                        revised = sum(
+                            expected_content[key] != actual_content[key]
+                            for key in expected & actual
+                        )
+                    else:
+                        expected = {eval_signature(row) for row in expected_rows}
+                        actual = {eval_signature(row) for row in actual_rows}
+                        revised = 0
+                    missing = expected - actual
+                    report["inherited_files"] = int(report["inherited_files"]) + 1
+                    report["inherited_eval_cases"] = int(report["inherited_eval_cases"]) + len(expected)
+                    report["preserved_eval_cases"] = int(report["preserved_eval_cases"]) + len(expected & actual)
+                    report["revised_eval_cases"] = int(report["revised_eval_cases"]) + revised
+                    if missing and "evals" not in removals:
+                        report["missing"].append(
+                            {"source": source, "resource": "evals", "missing_cases": len(missing)}
+                        )
+                        raise SystemExit(
+                            f"merge/update dropped {len(missing)} inherited eval case(s) "
+                            f"from {source} into {record['skill']}"
+                        )
+                    if missing:
+                        report["explicitly_removed_files"] = int(report["explicitly_removed_files"]) + 1
+                    else:
+                        report["preserved_files"] = int(report["preserved_files"]) + 1
+                    continue
+                for relative in paths:
+                    report["inherited_files"] = int(report["inherited_files"]) + 1
+                    if relative.as_posix() in removals:
+                        report["explicitly_removed_files"] = int(report["explicitly_removed_files"]) + 1
+                        continue
+                    if not (target / relative).is_file():
+                        report["missing"].append(
+                            {"source": source, "resource": relative.as_posix()}
+                        )
+                        raise SystemExit(
+                            f"merge/update dropped inherited resource {relative.as_posix()} "
+                            f"from {source} into {record['skill']}"
+                        )
+                    report["preserved_files"] = int(report["preserved_files"]) + 1
+    inherited = int(report["inherited_files"])
+    report["preservation_rate"] = (
+        round(int(report["preserved_files"]) / inherited, 6)
+        if inherited
+        else 1.0
+    )
+    return report
+
+
+def judge_action(verification: Path) -> str:
+    data = pipeline_contracts.validate_verification(verification, judged=True)
+    action = ((data.get("feedback") or {}).get("action") or {}).get("op")
+    if action not in {"pass", "fail"}:
+        raise SystemExit(f"judge did not set pass or fail in {verification}")
+    return action
+
+
+def apply_judge_formula(verification: Path) -> str:
+    """Apply the validated, non-discretionary Judge pass/fail formula."""
+    data = pipeline_contracts.validate_verification(verification, judged=False)
+    feedback = data["feedback"]
+    action = "pass" if feedback["overall_status"] == "pass" else "fail"
+    feedback["action"] = {"op": action, "to": None}
+    atomic_write_json(verification, data)
+    pipeline_contracts.validate_verification(verification, judged=True)
+    return action
+
+
+def validate_replay_artifacts(
+    workspace: Path, verification: dict
+) -> list[Path]:
+    replay = ((verification.get("feedback") or {}).get("replay") or {})
+    if replay.get("available") is not True:
+        return []
+    root = workspace / "run/replay"
+    manifest = root / "manifest.json"
+    benchmark = root / "benchmark.json"
+    held_out = root / "held-out-evals.json"
+    require_path(manifest, "behavioral replay manifest")
+    require_path(benchmark, "behavioral replay benchmark")
+    require_path(held_out, "behavioral replay held-out evals")
+    manifest_data = json.loads(manifest.read_text())
+    manifest_problems = skill_evaluation.validate_replay_manifest_data(
+        manifest_data
+    )
+    if manifest_problems:
+        raise SystemExit(
+            "invalid behavioral replay manifest: "
+            + "; ".join(manifest_problems)
+        )
+    skill_name = str(manifest_data.get("skill") or "")
+    development = (
+        workspace
+        / "target/to_be_improved_skills"
+        / skill_name
+        / "evals/evals.json"
+    )
+    require_path(development, "development evals")
+    development_data = json.loads(development.read_text())
+    held_out_data = json.loads(held_out.read_text())
+    held_out_problems = skill_evaluation.validate_held_out_evals_data(
+        held_out_data,
+        skill_name,
+        development_data,
+    )
+    held_out_digest = hashlib.sha256(held_out.read_bytes()).hexdigest()
+    if manifest_data.get("held_out_sha256") != held_out_digest:
+        held_out_problems.append(
+            "manifest held_out_sha256 does not match held-out-evals.json"
+        )
+    held_out_ids = [
+        row.get("id")
+        for row in held_out_data.get("evals") or []
+        if isinstance(row, dict)
+    ]
+    if manifest_data.get("held_out_eval_ids") != held_out_ids:
+        held_out_problems.append(
+            "manifest held_out_eval_ids do not match held-out-evals.json"
+        )
+    if held_out_problems:
+        raise SystemExit(
+            "invalid held-out behavioral evals: "
+            + "; ".join(held_out_problems)
+        )
+    benchmark_problems = skill_evaluation.validate_benchmark_data(
+        json.loads(benchmark.read_text())
+    )
+    if benchmark_problems:
+        raise SystemExit(
+            "invalid behavioral replay benchmark: "
+            + "; ".join(benchmark_problems)
+        )
+    if (
+        replay.get("kind") == "paired_skill_eval"
+        and replay.get("status") == "pass"
+        and not replay_meets_promotion_gate(replay)
+    ):
+        raise SystemExit(
+            "paired replay claimed pass without meeting anti-overfit "
+            "held-out and activation thresholds"
+        )
+    return [manifest, benchmark, held_out]
+
+
+def replay_meets_promotion_gate(replay: dict) -> bool:
+    if (
+        replay.get("available") is not True
+        or replay.get("status") != "pass"
+        or replay.get("kind") != "paired_skill_eval"
+    ):
+        return False
+    after = replay.get("after") or {}
+    policy = preprocessing_config().get("evolution_policy") or {}
+    return (
+        int(after.get("held_out_cases") or 0)
+        >= int(policy.get("promotion_min_held_out_cases", 2))
+        and float(after.get("held_out_pass_rate", 0))
+        >= float(policy.get("promotion_min_held_out_pass_rate", 0.8))
+        and float(after.get("activation_false_positive_rate", 1))
+        <= float(
+            policy.get(
+                "promotion_max_activation_false_positive_rate",
+                0.2,
+            )
+        )
+    )
+
+
+def execute_configured_held_out_replay(
+    workspace: Path,
+    verification_path: Path,
+    op: dict,
+    *,
+    held_out_workspace: Path | None = None,
+) -> None:
+    """Attach real paired replay when an external held-out set is available."""
+    names, _ = optimize_written_and_removed(op)
+    if len(names) != 1:
+        return
+    skill = names[0]
+    held_out = (
+        held_out_workspace or workspace
+    ) / "evaluation/held_out" / f"{skill}.json"
+    candidate = workspace / "target/to_be_improved_skills" / skill
+    development = candidate / "evals/evals.json"
+    if not held_out.is_file() or not development.is_file() or not candidate.is_dir():
+        return
+    verification = json.loads(verification_path.read_text())
+    replay = replay_runner.execute(
+        workspace,
+        skill,
+        candidate,
+        development,
+        held_out,
+    )
+    verification["feedback"]["replay"] = replay
+    if replay.get("available") is True and replay.get("status") != "pass":
+        verification["feedback"]["overall_status"] = "fail"
+    atomic_write_json(verification_path, verification)
+
+
+def archive_verification(workspace: Path, cluster: str, op_index: int) -> None:
+    source = workspace / "run/verification.json"
+    require_path(source, "verification")
+    target = workspace / "run" / cluster / "ops" / str(op_index)
+    target.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target / "verification.json")
+    verification_input = workspace / "run/verification-input.json"
+    require_path(verification_input, "verification input")
+    shutil.copy2(verification_input, target / "verification-input.json")
+    goal = target / "evolve-goal.json"
+    require_path(goal, "operation goal")
+    changelog_source = workspace / "run/changelog.json"
+    require_path(changelog_source, "operation changelog")
+    changelog = target / "changelog.json"
+    shutil.copy2(changelog_source, changelog)
+    write_judge_record(target)
+    pipeline_contracts.validate_operation_artifacts(target)
+
+
+def _empty_diagnosis() -> dict[str, object]:
+    return {
+        "skill_capabilities_missing": [],
+        "newly_detected_skill_capabilites_missing": [],
+    }
+
+
+def _diagnose_scope(
+    workspace: Path,
+    cluster: str,
+    suffix: str,
+    *,
+    clustered: bool,
+    unit_kind: str,
+    workers: int,
+    pool_items: int,
+    ready_us: int,
+    auth: dict[str, str],
+    model: str | None,
+    install_agent: bool,
+) -> tuple[str, str, Path]:
+    stage = "label-traces-cluster"
+    queue_wait_ms = record_queue(
+        workspace,
+        "diagnosis-queue",
+        suffix,
+        ready_us,
+        {"workers": workers, "pool_items": pool_items},
+    )
+    private = copy_worker(workspace, stage, suffix)
+    diagnosis = private / "run/diagnosis.json"
+    diagnosis.unlink(missing_ok=True)
+    source = scope_source(cluster, clustered, unit_kind)
+    embedded_source = ""
+    if unit_kind == "finding":
+        finding_path = scope_source_path(private, source) / "finding.json"
+        if finding_path.is_file():
+            embedded_source = (
+                "The complete finding.json input is embedded below. Do not "
+                "read it from disk or look for alternate copies.\n"
+                "<finding-json>\n"
+                f"{finding_path.read_text()}"
+                "</finding-json>\n"
+            )
+    try:
+        run_session(
+            stage,
+            private,
+            instruction(
+                stage,
+                f"This isolated session is cluster <{cluster}> at {source}. "
+                f"{embedded_source}"
+                "Use the finding slice as the trace. "
+                "In legacy cluster mode read slice in cut.jsonl when it "
+                "exists. Do not open canonical turns, manifest turn paths, "
+                "or tool sidecars. The cwd's workspace entry already points "
+                "at the worker root; do not create a nested workspace "
+                f"directory. Write only this cluster's records exactly to "
+                f"{diagnosis}. Then run exactly `python3 "
+                "02.2_label_traces_cluster_agent/dignosis/"
+                f"evolve-goal-checker.py {diagnosis}` once. Do not search "
+                "for the checker.",
+            ),
+            auth,
+            model,
+            install_agent,
+            suffix,
+            {
+                "workers": workers,
+                "pool_items": pool_items,
+                "queue_wait_ms": queue_wait_ms,
+                **diagnosis_slice_metadata(workspace, str(cluster), unit_kind),
+                **_finding_audit(workspace, str(cluster)),
+            },
+        )
+        pipeline_contracts.validate_diagnosis(
+            diagnosis, {cluster} if clustered else None
+        )
+        return cluster, suffix, private
+    except BaseException as error:
+        write_status(
+            workspace, stage, suffix, "failed", error=failure_text(error)
+        )
+        remove_worker_workspace(private)
+        raise
+
+
+def _publish_diagnosis(
+    workspace: Path, cluster: str, suffix: str, private: Path
+) -> dict[str, object]:
+    source = private / "run/diagnosis.json"
+    data = json.loads(source.read_text())
+    scoped = workspace / "run" / cluster / "diagnosis.json"
+    replace_path(source, scoped)
+    merge_worker_log(private, workspace)
+    complete_session(workspace, "label-traces-cluster", suffix, [scoped])
+    return data if isinstance(data, dict) else {}
+
+
+def _diagnosis_document(
+    clusters: list[str], published: dict[str, dict[str, object]]
+) -> dict[str, object]:
+    known: list[object] = []
+    ood: list[object] = []
+    feedback: dict[str, object] = {}
+    for cluster in clusters:
+        data = published[cluster]
+        known.extend(data.get("skill_capabilities_missing") or [])
+        ood.extend(data.get("newly_detected_skill_capabilites_missing") or [])
+        if "feedback" in data:
+            feedback[cluster] = data["feedback"]
+    document: dict[str, object] = {
+        "skill_capabilities_missing": known,
+        "newly_detected_skill_capabilites_missing": ood,
+    }
+    if feedback:
+        document["feedback_by_cluster"] = feedback
+    return document
+
+
+def fanout_diagnosis(
+    workspace: Path,
+    run_id: str,
+    clusters: list[str],
+    clustered: bool,
+    workers: int,
+    auth: dict[str, str],
+    model: str | None,
+    install_agent: bool,
+    unit_kind: str = "cluster",
+) -> Path:
+    stage = "label-traces-cluster"
+    clusters = agent_scopes(workspace, clusters)
+    aggregate = workspace / "run/diagnosis.json"
+    if not clusters:
+        atomic_write_json(aggregate, _empty_diagnosis())
+        return aggregate
+    items = [(cluster, f"{run_id}-{cluster}") for cluster in clusters]
+    for _cluster, suffix in items:
+        write_status(workspace, stage, suffix, "started")
+
+    ready_us = time.time_ns() // 1000
+
+    def work(item: object) -> object:
+        cluster, suffix = item
+        return _diagnose_scope(
+            workspace,
+            str(cluster),
+            str(suffix),
+            clustered=clustered,
+            unit_kind=unit_kind,
+            workers=workers,
+            pool_items=len(items),
+            ready_us=ready_us,
+            auth=auth,
+            model=model,
+            install_agent=install_agent,
+        )
+
+    try:
+        results = run_pool(items, workers, work)
+    except BaseException:
+        remove_worker_stage(workspace, stage)
+        raise
+    try:
+        published = {
+            str(cluster): _publish_diagnosis(
+                workspace, str(cluster), str(suffix), private
+            )
+            for cluster, suffix, private in results
+        }
+        document = _diagnosis_document(clusters, published)
+        atomic_write_json(aggregate, document)
+        pipeline_contracts.validate_diagnosis(
+            aggregate, set(clusters) if clustered else None
+        )
+        return aggregate
+    finally:
+        for _cluster, _suffix, private in results:
+            remove_worker_workspace(private)
+
+
+def _goal_skill_names(
+    goal_path: Path | None, recalled: list[dict] | None
+) -> list[str]:
+    """Names the live goal bar can show before an operation changelog exists."""
+    names: list[str] = []
+
+    def add(value: object) -> None:
+        if not isinstance(value, str):
+            return
+        name = skill_names_mod.bare(value).strip()
+        if name and name not in names:
+            names.append(name)
+
+    if goal_path is not None and goal_path.is_file():
+        try:
+            data = json.loads(goal_path.read_text())
+        except json.JSONDecodeError:
+            data = None
+        if isinstance(data, dict):
+            goal = data.get("goal")
+            if isinstance(goal, dict):
+                improve = goal.get("improve_skills")
+                if isinstance(improve, list):
+                    for item in improve:
+                        if isinstance(item, str):
+                            add(item)
+                        elif isinstance(item, dict):
+                            add(item.get("skill"))
+            action = data.get("action")
+            if isinstance(action, dict):
+                for op in action.get("ops") or []:
+                    if isinstance(op, dict):
+                        for name in skill_names_mod.skill_names(op):
+                            add(name)
+    if names:
+        return names
+    for row in recalled or []:
+        if isinstance(row, dict):
+            add(row.get("skill"))
+    return names
+
+
+def _publish_goal_skills(
+    workspace: Path,
+    suffix: str,
+    *,
+    goal_path: Path | None = None,
+    recalled: list[dict] | None = None,
+) -> None:
+    names = _goal_skill_names(goal_path, recalled)
+    if names:
+        write_status(workspace, "goal", suffix, "started", skills=names)
+
+
+def _goal_scope(
+    workspace: Path,
+    cluster: str,
+    suffix: str,
+    *,
+    clustered: bool,
+    unit_kind: str,
+    workers: int,
+    pool_items: int,
+    ready_us: int,
+    auth: dict[str, str],
+    model: str | None,
+    install_agent: bool,
+) -> tuple[str, str, Path]:
+    stage = "goal"
+    queue_wait_ms = record_queue(
+        workspace,
+        "goal-queue",
+        suffix,
+        ready_us,
+        {"workers": workers, "pool_items": pool_items},
+    )
+    private = copy_worker(workspace, stage, suffix)
+    private_cluster = private / "run" / cluster
+    scoped_diagnosis = private_cluster / "diagnosis.json"
+    scoped_diagnosis_bytes = (
+        scoped_diagnosis.read_bytes() if scoped_diagnosis.is_file() else None
+    )
+    if private_cluster.exists():
+        shutil.rmtree(private_cluster)
+    if scoped_diagnosis_bytes is not None:
+        diagnosis_path = private / "run/diagnosis.json"
+        diagnosis_path.parent.mkdir(parents=True, exist_ok=True)
+        diagnosis_path.write_bytes(scoped_diagnosis_bytes)
+    source = scope_source(cluster, clustered, unit_kind)
+    try:
+        matching = private_cluster / "label-matching.json"
+        goal = private_cluster / "evolve-goal.json"
+        cluster_source = (
+            private / "traces/derived/findings"
+            if unit_kind == "finding"
+            else private / "traces/derived/cluster"
+        )
+        taxonomy_path = ROOT / "skill_capabilites/skill_capabilites.json"
+        recall_config_path = ROOT / "common/recall-config.json"
+        preflight_available = (
+            taxonomy_path.is_file()
+            and recall_config_path.is_file()
+            and (private / "run/diagnosis.json").is_file()
+            and (
+                private
+                / "target/to_be_improved_skills_metadata/metadata.json"
+            ).is_file()
+        )
+        recalled: list[dict] | None = None
+        finding_path = scope_source_path(private, source) / "finding.json"
+        inventory_skills: list[str] = []
+        finding_data: dict[str, object] = {}
+        if finding_path.is_file():
+            value = json.loads(finding_path.read_text())
+            finding_data = value if isinstance(value, dict) else {}
+            features = finding_data.get("features") if isinstance(finding_data, dict) else {}
+            if isinstance(features, dict) and features.get("candidate_source") == "inventory_maintenance":
+                inventory_skills = [
+                    str(name) for name in features.get("candidate_skills") or [] if name
+                ]
+        diagnosis = (
+            json.loads((private / "run/diagnosis.json").read_text())
+            if preflight_available
+            else {}
+        )
+        empty_diagnosis = (
+            not inventory_skills
+            and diagnosis.get("skill_capabilities_missing") == []
+            and diagnosis.get("newly_detected_skill_capabilites_missing") == []
+        )
+        if empty_diagnosis:
+            reason = (
+                "Diagnosis found no missing skill capability; goal generation "
+                "terminated deterministically without an agent call."
+            )
+            atomic_write_json(
+                matching,
+                {
+                    "matching": {
+                        "strategy": "empty-diagnosis-terminal-v1",
+                        "config_version": 1,
+                        "config_sha256": hashlib.sha256(
+                            b"empty-diagnosis-terminal-v1"
+                        ).hexdigest(),
+                    },
+                    "clusters": [
+                        {"cluster": cluster, "labels": [], "skills": []}
+                    ],
+                },
+            )
+            atomic_write_json(
+                goal,
+                {
+                    "goal": {
+                        "improve_harness": {"scope": "out_of_scope"},
+                        "improve_skills": [],
+                        "avoid": "Do not invent a skill gap absent from diagnosis.",
+                    },
+                    "reasoning": reason,
+                    "plan": "Leave skills unchanged.",
+                    "feedback_to": "diagnosis",
+                    "action": {
+                        "disposition": "no_change",
+                        "reason": reason,
+                        "ops": [],
+                    },
+                },
+            )
+            with pipeline_metrics.span(
+                workspace,
+                stage,
+                suffix,
+                "deterministic",
+                metadata={"empty_diagnosis_terminal": True},
+            ):
+                pass
+            pipeline_contracts.validate_label_matching(matching, cluster)
+            pipeline_contracts.validate_goal(goal)
+            _emit_goal_decision(workspace, str(cluster), goal)
+            return cluster, suffix, private
+        if inventory_skills:
+            matching_data = {
+                "matching": {
+                    "strategy": "inventory-maintenance-v1",
+                    "config_version": 1,
+                    "config_sha256": hashlib.sha256(
+                        json.dumps(inventory_skills, sort_keys=True).encode()
+                    ).hexdigest(),
+                },
+                "clusters": [{
+                    "cluster": cluster,
+                    "labels": ["job/methodology"],
+                    "skills": [{
+                        "skill": name,
+                        "score": 1.0,
+                        "labels": [{"type": "job/methodology", "weight": 1.0}],
+                        "matches": [{
+                            "cluster_type": "job/methodology",
+                            "skill_type": "job/methodology",
+                            "similarity": 1.0,
+                            "contribution": 1.0,
+                        }],
+                    } for name in inventory_skills],
+                }],
+            }
+            atomic_write_json(matching, matching_data)
+            recalled = matching_data["clusters"][0]["skills"]
+        elif preflight_available:
+            metadata = json.loads(
+                (
+                    private
+                    / "target/to_be_improved_skills_metadata/metadata.json"
+                ).read_text()
+            )
+            skill_dirs = recall_skills_mod.skill_dirs(
+                private / "target/to_be_improved_skills"
+            )
+            cluster_dirs = recall_skills_mod.skill_dirs(cluster_source)
+            recall_selection = (
+                ACTIVE_EXECUTION_CONFIG.get("phases", {}).get("recall", {})
+            )
+            if recall_selection.get("kind") == "embedding-service":
+                embedding_config = {
+                    **recall_selection,
+                    "skills_root": str(
+                        private / "target/to_be_improved_skills"
+                    ),
+                }
+                try:
+                    matching_data = embedding_recall(
+                        diagnosis, metadata, skill_dirs, embedding_config
+                    )
+                except (EmbeddingServiceError, KeyError, OSError, ValueError) as error:
+                    if recall_selection.get("on_error", "fallback") != "fallback":
+                        raise
+                    leaves = recall_skills_mod.skill_type_checker.leaf_paths(
+                        taxonomy_path
+                    )
+                    recall_config = recall_skills_mod.load_config(recall_config_path)
+                    matching_data = recall_skills_mod.recall(
+                        diagnosis, metadata, skill_dirs, cluster_dirs, leaves, recall_config
+                    )
+                    matching_data["matching"]["fallback_from"] = recall_selection.get(
+                        "algorithm"
+                    )
+                    matching_data["matching"]["fallback_error"] = {
+                        "type": type(error).__name__,
+                        "message": failure_text(error),
+                    }
+            else:
+                leaves = recall_skills_mod.skill_type_checker.leaf_paths(
+                    taxonomy_path
+                )
+                recall_config = recall_skills_mod.load_config(recall_config_path)
+                matching_data = recall_skills_mod.recall(
+                    diagnosis,
+                    metadata,
+                    skill_dirs,
+                    cluster_dirs,
+                    leaves,
+                    recall_config,
+                )
+            if not any(
+                cluster_row.get("skills")
+                for cluster_row in matching_data.get("clusters") or []
+                if isinstance(cluster_row, dict)
+                and (
+                    cluster_row.get("cluster") == cluster
+                    or cluster == "cut" and "cluster" not in cluster_row
+                )
+            ):
+                fallback = lexical_inventory_fallback(
+                    diagnosis,
+                    finding_data,
+                    metadata,
+                    private / "target/to_be_improved_skills",
+                )
+                if fallback:
+                    matching_data["clusters"] = [
+                        {
+                            "cluster": cluster,
+                            "labels": [],
+                            "skills": fallback,
+                        }
+                    ]
+                    matching_data["matching"]["fallback"] = (
+                        "ood-lexical-collision-guard-v1"
+                    )
+            scoped_matches = [
+                row
+                for row in matching_data["clusters"]
+                if row.get("cluster") == cluster
+                or (cluster == "cut" and "cluster" not in row)
+            ]
+            if not scoped_matches:
+                scoped_matches = [
+                    {"cluster": cluster, "labels": [], "skills": []}
+                ]
+            matching_data = {
+                "matching": matching_data["matching"],
+                "clusters": scoped_matches,
+            }
+            atomic_write_json(matching, matching_data)
+            matching_data = pipeline_contracts.validate_label_matching(
+                matching, cluster
+            )
+            recalled = matching_data["clusters"][0]["skills"]
+        creation_error: str | None = None
+        if recalled == []:
+            try:
+                enforce_creation_policy(
+                    workspace, cluster, {}, {"op": "create", "skills": []}
+                )
+            except pipeline_contracts.ContractError as error:
+                creation_error = str(error)
+        applied_skills = previously_applied_finding_skills(
+            private, str(cluster), recalled, finding_data
+        )
+        if applied_skills:
+            reason = (
+                "This exact finding was already applied to a current inventory "
+                f"skill: {', '.join(applied_skills)}. Reprocessing the same "
+                "evidence is idempotent; require a new finding or new behavior "
+                "before another edit."
+            )
+            atomic_write_json(
+                goal,
+                {
+                    "goal": {
+                        "improve_harness": {"scope": "out_of_scope"},
+                        "improve_skills": [],
+                        "avoid": "Do not apply the same finding twice.",
+                    },
+                    "reasoning": reason,
+                    "plan": "Leave the current skills unchanged.",
+                    "feedback_to": "diagnosis",
+                    "action": {
+                        "disposition": "no_change",
+                        "reason": reason,
+                        "ops": [],
+                    },
+                },
+            )
+            with pipeline_metrics.span(
+                workspace,
+                stage,
+                suffix,
+                "deterministic",
+                metadata={
+                    "applied_finding_terminal": True,
+                    "applied_skills": applied_skills,
+                },
+            ):
+                pass
+        elif creation_error is not None:
+            atomic_write_json(
+                goal,
+                {
+                    "goal": {
+                        "improve_harness": {"scope": "out_of_scope"},
+                        "improve_skills": [],
+                        "avoid": (
+                            "Do not create or edit a skill without "
+                            "policy-qualified evidence."
+                        ),
+                    },
+                    "reasoning": creation_error,
+                    "plan": "Leave skills unchanged.",
+                    "feedback_to": "diagnosis",
+                    "action": {
+                        "disposition": "no_change",
+                        "reason": creation_error,
+                        "ops": [],
+                    },
+                },
+            )
+            with pipeline_metrics.span(
+                workspace,
+                stage,
+                suffix,
+                "deterministic",
+                metadata={"policy_no_change": True},
+            ):
+                pass
+        else:
+            if matching.is_file():
+                diagnosis_text = (private / "run/diagnosis.json").read_text()
+                matching_text = matching.read_text()
+                finding_path = scope_source_path(private, source) / "finding.json"
+                finding_text = (
+                    finding_path.read_text() if finding_path.is_file() else ""
+                )
+                merge_path = workspace / "run/inventory-merge-candidates.json"
+                merge_document = (
+                    json.loads(merge_path.read_text()) if merge_path.is_file() else {}
+                )
+                recalled_names = {
+                    str(row.get("skill"))
+                    for row in recalled or []
+                    if isinstance(row, dict) and row.get("skill")
+                }
+                relevant_candidates = [
+                    row
+                    for row in merge_document.get("candidates") or []
+                    if isinstance(row, dict)
+                    and recalled_names.intersection(row.get("skills") or [])
+                ]
+                has_retirement = any(
+                    row.get("operation_hint") == "delete"
+                    for row in relevant_candidates
+                )
+                merge_context = {
+                    "algorithm": merge_document.get("algorithm"),
+                    "candidates": relevant_candidates,
+                    "instruction": (
+                        "A retirement candidate may use delete only for its "
+                        "delete_skill when the recorded post-creation non-use "
+                        "and capability/content subsumption are both valid; "
+                        "never delete the named subsuming skill. Otherwise "
+                        "choose no_change."
+                        if has_retirement else
+                        "Consider merge only when this finding applies to both skills "
+                        "and one result preserves their non-overlapping capabilities. "
+                        "Otherwise prefer update or no_change."
+                    ),
+                }
+                session_context = (
+                    "Select is already complete. The complete inputs are "
+                    "embedded below; do not read them from disk, glob for "
+                    "copies, or run recall again.\n"
+                    f"<diagnosis-json>\n{diagnosis_text}</diagnosis-json>\n"
+                    f"<label-matching-json>\n{matching_text}"
+                    "</label-matching-json>\n"
+                    f"<finding-json>\n{finding_text}</finding-json>\n"
+                    "<recalled-skill-evidence-json>\n"
+                    f"{json.dumps(recalled_skill_evidence(private / 'target/to_be_improved_skills', recalled), indent=2, ensure_ascii=False)}\n"
+                    "</recalled-skill-evidence-json>\n"
+                    "<inventory-merge-candidates-json>\n"
+                    f"{json.dumps(merge_context, indent=2, ensure_ascii=False)}\n"
+                    "</inventory-merge-candidates-json>\n"
+                    f"Write {goal}."
+                )
+            else:
+                clusters_argument = (
+                    " --clusters workspace/traces/derived/findings"
+                    if unit_kind == "finding"
+                    else ""
+                )
+                session_context = (
+                    f"Run select with `--cluster '{cluster}'"
+                    f"{clusters_argument} --out {matching}`, then write {goal}."
+                )
+            _publish_goal_skills(workspace, suffix, recalled=recalled)
+            run_session(
+                stage,
+                private,
+                instruction(
+                    stage,
+                    f"This isolated session is cluster <{cluster}> at {source}. "
+                    f"{session_context} The cwd's workspace entry already "
+                    "points at the worker root; do not create a nested "
+                    "workspace directory. Then run exactly `python3 "
+                    "03_goal_agent/goal-generator/one_action.py "
+                    f"{goal}` once. Do not search for the validator.",
+                    skill_paths=(
+                        ["03_goal_agent/goal-generator/skill.md"]
+                        if matching.is_file()
+                        else None
+                    ),
+                ),
+                auth,
+                model,
+                install_agent,
+                suffix,
+                {
+                    "workers": workers,
+                    "pool_items": pool_items,
+                    "queue_wait_ms": queue_wait_ms,
+                },
+            )
+        pipeline_contracts.validate_label_matching(matching, cluster)
+        pipeline_contracts.validate_goal(goal)
+        _publish_goal_skills(
+            workspace, suffix, goal_path=goal, recalled=recalled
+        )
+        _emit_goal_decision(workspace, str(cluster), goal)
+        return cluster, suffix, private
+    except BaseException as error:
+        write_status(
+            workspace, stage, suffix, "failed", error=failure_text(error)
+        )
+        remove_worker_workspace(private)
+        raise
+
+
+def _publish_goal(
+    workspace: Path, cluster: str, suffix: str, private: Path
+) -> None:
+    source = private / "run" / cluster
+    target = workspace / "run" / cluster
+    target.mkdir(parents=True, exist_ok=True)
+    matching = target / "label-matching.json"
+    goal = target / "evolve-goal.json"
+    replace_path(source / "label-matching.json", matching)
+    replace_path(source / "evolve-goal.json", goal)
+    matching_document = json.loads(matching.read_text())
+    metadata_path = (
+        workspace / "target/to_be_improved_skills_metadata/metadata.json"
+    )
+    metadata_document = (
+        json.loads(metadata_path.read_text()) if metadata_path.is_file() else {}
+    )
+    inventory_skills = [
+        str(row["skill"])
+        for row in metadata_document.get("skills_metadata") or []
+        if isinstance(row, dict) and row.get("skill")
+    ]
+    recalled = [
+        row
+        for cluster_row in matching_document.get("clusters") or []
+        if isinstance(cluster_row, dict)
+        for row in cluster_row.get("skills") or []
+        if isinstance(row, dict)
+    ]
+    pipeline_metrics.record_skill_recall_observations(
+        workspace, cluster, inventory_skills, recalled
+    )
+    merge_worker_log(private, workspace)
+    sync_skill_changelogs(workspace)
+    complete_session(workspace, "goal", suffix, [matching, goal])
+
+
+def fanout_goals(
+    workspace: Path,
+    run_id: str,
+    clusters: list[str],
+    clustered: bool,
+    workers: int,
+    auth: dict[str, str],
+    model: str | None,
+    install_agent: bool,
+    unit_kind: str = "cluster",
+) -> None:
+    stage = "goal"
+    clusters = agent_scopes(workspace, clusters)
+    if not clusters:
+        return
+    items = [(cluster, f"{run_id}-{cluster}") for cluster in clusters]
+    for _cluster, suffix in items:
+        write_status(workspace, stage, suffix, "started")
+    ready_us = time.time_ns() // 1000
+
+    def work(item: object) -> object:
+        cluster, suffix = item
+        return _goal_scope(
+            workspace,
+            str(cluster),
+            str(suffix),
+            clustered=clustered,
+            unit_kind=unit_kind,
+            workers=workers,
+            pool_items=len(items),
+            ready_us=ready_us,
+            auth=auth,
+            model=model,
+            install_agent=install_agent,
+        )
+
+    try:
+        results = run_pool(items, workers, work)
+    except BaseException:
+        remove_worker_stage(workspace, stage)
+        raise
+    try:
+        for cluster, suffix, private in results:
+            _publish_goal(workspace, str(cluster), str(suffix), private)
+    finally:
+        for _cluster, _suffix, private in results:
+            remove_worker_workspace(private)
+
+
+def pipeline_diagnosis_and_goals(
+    workspace: Path,
+    run_id: str,
+    clusters: list[str],
+    clustered: bool,
+    workers: int,
+    auth: dict[str, str],
+    model: str | None,
+    install_agent: bool,
+    unit_kind: str = "cluster",
+) -> Path:
+    """Run each goal as soon as its diagnosis is published.
+
+    Diagnosis and goal share one worker cap. Operation scheduling still waits
+    for every goal so same-skill edits can be reduced together.
+    """
+    clusters = agent_scopes(workspace, clusters)
+    aggregate = workspace / "run/diagnosis.json"
+    if not clusters:
+        atomic_write_json(aggregate, _empty_diagnosis())
+        return aggregate
+    if workers < 1:
+        raise SystemExit("worker count must be at least 1")
+    items = [(cluster, f"{run_id}-{cluster}") for cluster in clusters]
+    for _cluster, suffix in items:
+        write_status(workspace, "label-traces-cluster", suffix, "started")
+    diagnosis_ready_us = time.time_ns() // 1000
+    published: dict[str, dict[str, object]] = {}
+    goal_futures: dict[Future, tuple[str, str]] = {}
+    failures: list[str] = []
+    try:
+        with ThreadPoolExecutor(
+            max_workers=min(workers, len(items))
+        ) as pool:
+            diagnosis_futures = {
+                pool.submit(
+                    _diagnose_scope,
+                    workspace,
+                    cluster,
+                    suffix,
+                    clustered=clustered,
+                    unit_kind=unit_kind,
+                    workers=workers,
+                    pool_items=len(items),
+                    ready_us=diagnosis_ready_us,
+                    auth=auth,
+                    model=model,
+                    install_agent=install_agent,
+                ): (cluster, suffix)
+                for cluster, suffix in items
+            }
+            try:
+                for future in as_completed(diagnosis_futures):
+                    _expected_cluster, expected_suffix = diagnosis_futures[future]
+                    try:
+                        cluster, suffix, private = future.result()
+                    except BaseException as error:
+                        failures.append(
+                            f"diagnosis {expected_suffix}: {failure_text(error)}"
+                        )
+                        write_status(
+                            workspace,
+                            "goal",
+                            expected_suffix,
+                            "skipped",
+                            error=(
+                                "upstream diagnosis failed: "
+                                f"{failure_text(error)}"
+                            ),
+                        )
+                        continue
+                    try:
+                        published[str(cluster)] = _publish_diagnosis(
+                            workspace, str(cluster), str(suffix), private
+                        )
+                    finally:
+                        remove_worker_workspace(private)
+                    write_status(workspace, "goal", suffix, "started")
+                    goal_futures[
+                        pool.submit(
+                            _goal_scope,
+                            workspace,
+                            str(cluster),
+                            str(suffix),
+                            clustered=clustered,
+                            unit_kind=unit_kind,
+                            workers=workers,
+                            pool_items=len(items),
+                            ready_us=time.time_ns() // 1000,
+                            auth=auth,
+                            model=model,
+                            install_agent=install_agent,
+                        )
+                    ] = (str(cluster), str(suffix))
+                successful_diagnoses = [
+                    cluster for cluster in clusters if cluster in published
+                ]
+                document = _diagnosis_document(successful_diagnoses, published)
+                with tempfile.NamedTemporaryFile(
+                    suffix=".json", delete=False
+                ) as handle:
+                    temporary = Path(handle.name)
+                try:
+                    atomic_write_json(temporary, document)
+                    pipeline_contracts.validate_diagnosis(
+                        temporary,
+                        set(successful_diagnoses) if clustered else None,
+                    )
+                finally:
+                    temporary.unlink(missing_ok=True)
+                for future in as_completed(list(goal_futures)):
+                    try:
+                        cluster, suffix, private = future.result()
+                    except BaseException as error:
+                        expected_cluster, expected_suffix = goal_futures[future]
+                        failures.append(
+                            f"goal {expected_suffix}: {failure_text(error)}"
+                        )
+                        continue
+                    try:
+                        _publish_goal(workspace, cluster, suffix, private)
+                    finally:
+                        remove_worker_workspace(private)
+                atomic_write_json(aggregate, document)
+                pipeline_contracts.validate_diagnosis(
+                    aggregate,
+                    set(successful_diagnoses) if clustered else None,
+                )
+                if failures:
+                    raise RuntimeError(
+                        "selected scope processing failed; refusing to record "
+                        "no_change: " + "; ".join(failures)
+                    )
+            except BaseException:
+                for future in (*diagnosis_futures, *goal_futures):
+                    future.cancel()
+                raise
+    finally:
+        remove_worker_stage(workspace, "label-traces-cluster")
+        remove_worker_stage(workspace, "goal")
+        for parent in (
+            ROOT / ".pipeline-workers" / workspace.name,
+            ROOT / ".pipeline-workers",
+        ):
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+    return aggregate
+
+
+def configured_max_ops_per_skill(explicit: int | None = None) -> int:
+    """How many same-skill updates may share one optimize, verify, and judge."""
+    if explicit is not None:
+        return explicit
+    path = ROOT / "common/preprocessing-config.json"
+    if path.is_file():
+        try:
+            config = json.loads(path.read_text())
+        except json.JSONDecodeError:
+            config = {}
+        value = (config.get("evolution_policy") or {}).get("max_ops_per_skill")
+        if isinstance(value, int) and value >= 1:
+            return value
+    return 5
+
+
+def configured_min_super_score(explicit: float | None = None) -> float:
+    """Edits below this super score stay out of a same-skill bundle."""
+    if explicit is not None:
+        return explicit
+    path = ROOT / "common/preprocessing-config.json"
+    if path.is_file():
+        try:
+            config = json.loads(path.read_text())
+        except json.JSONDecodeError:
+            config = {}
+        value = (config.get("evolution_policy") or {}).get("min_super_score")
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+            return float(value)
+    return 0.0
+
+
+def _merge_change_rows(rows: list[object], key: str) -> list[dict[str, object]]:
+    merged: dict[tuple[str, str], dict[str, object]] = {}
+    order: list[tuple[str, str]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get(key) or "")
+        extra = str(row.get("heading") or row.get("name") or "")
+        identity = (name, extra)
+        goal = str(row.get("goal") or "").strip()
+        if identity not in merged:
+            merged[identity] = dict(row)
+            order.append(identity)
+            continue
+        previous = str(merged[identity].get("goal") or "").strip()
+        if goal and goal not in previous:
+            merged[identity]["goal"] = f"{previous}\n{goal}".strip()
+    return [merged[identity] for identity in order]
+
+
+def merge_update_ops(ops: list[dict[str, object]]) -> dict[str, object]:
+    """Collapse same-skill updates into one op the existing checkers accept."""
+    by_skill: dict[str, dict[str, object]] = {}
+    order: list[str] = []
+    for op in ops:
+        for row in op.get("skills") or []:
+            if not isinstance(row, dict) or not isinstance(row.get("skill"), str):
+                continue
+            name = row["skill"]
+            if name not in by_skill:
+                by_skill[name] = {
+                    "skill": name,
+                    "goals": [],
+                    "facet": row.get("facet"),
+                    "sections": [],
+                    "dirs": [],
+                    "remove": [],
+                    "resource_plans": [],
+                }
+                order.append(name)
+            bucket = by_skill[name]
+            text = str(row.get("goal") or "").strip()
+            goals = bucket["goals"]
+            if text and text not in goals:
+                goals.append(text)
+            if not bucket.get("facet") and row.get("facet"):
+                bucket["facet"] = row["facet"]
+            bucket["sections"].extend(row.get("sections") or [])
+            bucket["dirs"].extend(row.get("dirs") or [])
+            if isinstance(row.get("resource_plan"), list):
+                bucket["resource_plans"].append(row["resource_plan"])
+            for value in row.get("remove") or []:
+                if value not in bucket["remove"]:
+                    bucket["remove"].append(value)
+    skills: list[dict[str, object]] = []
+    for name in order:
+        bucket = by_skill[name]
+        item: dict[str, object] = {
+            "skill": name,
+            "goal": "\n".join(bucket["goals"]),
+            "sections": _merge_change_rows(bucket["sections"], "section"),
+            "dirs": _merge_change_rows(bucket["dirs"], "dir"),
+        }
+        if bucket["resource_plans"]:
+            selected = {
+                str(row.get("dir"))
+                for row in item["dirs"]
+                if isinstance(row, dict)
+            }
+            resource_plan: list[dict[str, object]] = []
+            for resource in skill_resources.RESOURCE_KINDS:
+                source_rows = [
+                    row
+                    for plan in bucket["resource_plans"]
+                    for row in plan
+                    if isinstance(row, dict) and row.get("resource") == resource
+                ]
+                reasons = [
+                    str(row.get("reason")).strip()
+                    for row in source_rows
+                    if str(row.get("reason") or "").strip()
+                ]
+                confidences = [
+                    float(row["confidence"])
+                    for row in source_rows
+                    if isinstance(row.get("confidence"), (int, float))
+                    and not isinstance(row.get("confidence"), bool)
+                ]
+                resource_plan.append(
+                    {
+                        "resource": resource,
+                        "decision": "use" if resource in selected else "omit",
+                        "reason": "\n".join(dict.fromkeys(reasons))
+                        or (
+                            "A merged directory goal requires this resource."
+                            if resource in selected
+                            else "No selected source goal requires this resource."
+                        ),
+                        "confidence": max(confidences, default=1.0),
+                    }
+                )
+            item["resource_plan"] = resource_plan
+        if bucket.get("facet"):
+            item["facet"] = bucket["facet"]
+        if bucket["remove"]:
+            item["remove"] = bucket["remove"]
+        skills.append(item)
+    return {"op": "update", "skills": skills}
+
+
+SEVERITY_WEIGHT = {"low": 0.25, "medium": 0.5, "high": 0.75, "critical": 1.0}
+
+
+def configured_priority_score() -> dict[str, float]:
+    defaults = {
+        "severity_weight": 0.4,
+        "confidence_weight": 0.3,
+        "detector_strength_weight": 0.2,
+        "skill_match_weight": 0.1,
+        "detector_saturation_scale": 4.0,
+    }
+    try:
+        config = json.loads((ROOT / "common/preprocessing-config.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return defaults
+    supplied = ((config.get("evolution_policy") or {}).get("priority_score") or {})
+    result = {
+        name: float(supplied.get(name, default))
+        for name, default in defaults.items()
+    }
+    weight_names = [name for name in result if name.endswith("_weight")]
+    total = sum(max(0.0, result[name]) for name in weight_names)
+    if total <= 0 or result["detector_saturation_scale"] <= 0:
+        return defaults
+    for name in weight_names:
+        result[name] = max(0.0, result[name]) / total
+    return result
+
+
+def rank_edit(workspace: Path, task: dict[str, object]) -> dict[str, object]:
+    """Score one same-skill edit for the merge gate.
+
+    ``score`` is the detector score. The score is compressed so detector
+    implementations with different raw ranges cannot dominate the gate.
+    ``super_score`` is a bounded weighted sum of severity, confidence,
+    detector strength, and normalized skill-match strength.
+    """
+    cluster = str(task["cluster"])
+    confidence = float(task.get("confidence") or 0)
+    severity = ""
+    raw_score = 0.0
+    finding_path = workspace / "traces/derived/findings" / cluster / "finding.json"
+    if finding_path.is_file():
+        try:
+            finding = json.loads(finding_path.read_text())
+        except json.JSONDecodeError:
+            finding = {}
+        if isinstance(finding, dict):
+            try:
+                confidence = float(finding.get("confidence") or confidence)
+            except (TypeError, ValueError):
+                pass
+            found_severity = finding.get("severity")
+            if isinstance(found_severity, str):
+                severity = found_severity
+            try:
+                raw_score = float(finding.get("score") or 0)
+            except (TypeError, ValueError):
+                raw_score = 0.0
+    skills = {str(name) for name in task.get("affected") or []}
+    match_score = 0.0
+    matching_path = workspace / "run" / cluster / "label-matching.json"
+    if matching_path.is_file():
+        try:
+            matching = json.loads(matching_path.read_text())
+        except json.JSONDecodeError:
+            matching = {}
+        for row in matching.get("clusters") or []:
+            if not isinstance(row, dict):
+                continue
+            for skill in row.get("skills") or []:
+                if not isinstance(skill, dict) or skill.get("skill") not in skills:
+                    continue
+                try:
+                    match_score = max(match_score, float(skill.get("score") or 0))
+                except (TypeError, ValueError):
+                    continue
+    severity_score = SEVERITY_WEIGHT.get(severity, 0.25)
+    confidence_score = max(0.0, min(1.0, confidence))
+    policy = configured_priority_score()
+    detector_score = abs(raw_score) / (
+        abs(raw_score) + policy["detector_saturation_scale"]
+    )
+    normalized_match_score = max(0.0, min(1.0, match_score))
+    super_score = (
+        policy["severity_weight"] * severity_score
+        + policy["confidence_weight"] * confidence_score
+        + policy["detector_strength_weight"] * detector_score
+        + policy["skill_match_weight"] * normalized_match_score
+    )
+    return {
+        "severity": severity or None,
+        "confidence": round(confidence, 6),
+        "score": round(raw_score, 6),
+        "match_score": round(match_score, 6),
+        "score_components": {
+            "severity": round(severity_score, 6),
+            "confidence": round(confidence_score, 6),
+            "detector_strength": round(detector_score, 6),
+            "skill_match": round(normalized_match_score, 6),
+        },
+        "super_score": round(super_score, 6),
+    }
+
+
+def _source_record(task: dict[str, object]) -> dict[str, object]:
+    rank = task.get("rank") if isinstance(task.get("rank"), dict) else {}
+    return {
+        "cluster": task["cluster"],
+        "op_index": task["op_index"],
+        "confidence": rank.get("confidence", task.get("confidence", 0)),
+        "severity": rank.get("severity"),
+        "score": rank.get("score", 0),
+        "match_score": rank.get("match_score", 0),
+        "score_components": rank.get("score_components", {}),
+        "super_score": rank.get("super_score", 0),
+        "goal": task.get("skill_goal", ""),
+        "sections": [
+            row.get("section")
+            for skill in (task["op"].get("skills") or [])
+            if isinstance(skill, dict)
+            for row in (skill.get("sections") or [])
+            if isinstance(row, dict) and row.get("section")
+        ],
+    }
+
+
+def bundle_same_skill_updates(
+    workspace: Path,
+    tasks: list[dict[str, object]],
+    max_ops: int,
+    min_super_score: float = 0.0,
+) -> list[dict[str, object]]:
+    """Keep the top updates of one skill in one op. Verify and judge stay one pass."""
+    if max_ops < 1:
+        raise SystemExit("max_ops_per_skill must be at least 1")
+    if min_super_score < 0:
+        raise SystemExit("min_super_score must be non-negative")
+    groups: dict[tuple[str, ...], list[dict[str, object]]] = {}
+    for task in tasks:
+        op = task.get("op")
+        affected = tuple(sorted(str(name) for name in task.get("affected") or []))
+        if (
+            isinstance(op, dict)
+            and op.get("op") == "update"
+            and affected
+        ):
+            groups.setdefault(affected, []).append(task)
+    consumed: set[int] = set()
+    replacements: dict[int, dict[str, object]] = {}
+    annotations: list[dict[str, object]] = []
+    for affected, group in groups.items():
+        if len(group) < 2:
+            continue
+        for task in group:
+            task["rank"] = rank_edit(workspace, task)
+        ranked = sorted(
+            group,
+            key=lambda task: (
+                -float((task.get("rank") or {}).get("super_score") or 0),
+                -float((task.get("rank") or {}).get("confidence") or 0),
+                str(task["cluster"]),
+                int(task["op_index"]),
+            ),
+        )
+        passed = [ranked[0]]
+        below_gate: list[dict[str, object]] = []
+        for task in ranked[1:]:
+            super_score = float((task.get("rank") or {}).get("super_score") or 0)
+            if super_score >= min_super_score:
+                passed.append(task)
+            else:
+                below_gate.append(task)
+        selected = passed[:max_ops]
+        dropped = (
+            [(task, "over_cap") for task in passed[max_ops:]]
+            + [(task, "below_gate") for task in below_gate]
+        )
+        representative = selected[0]
+        if len(selected) > 1:
+            merged = merge_update_ops(
+                [task["op"] for task in selected if isinstance(task.get("op"), dict)]
+            )
+            bundle = {
+                "schema_version": 1,
+                "max_ops_per_skill": max_ops,
+                "min_super_score": min_super_score,
+                "op": "update",
+                "skills": list(affected),
+                "selected": [_source_record(task) for task in selected],
+                "dropped": [
+                    {**_source_record(task), "reason": reason}
+                    for task, reason in dropped
+                ],
+            }
+            document = json.loads(Path(representative["op_goal"]).read_text())
+            improve: list[str] = []
+            for task in selected:
+                source = json.loads(Path(task["op_goal"]).read_text())
+                for name in (source.get("goal") or {}).get("improve_skills") or []:
+                    if isinstance(name, str) and name not in improve:
+                        improve.append(name)
+            document["goal"]["improve_skills"] = improve
+            document["action"]["ops"] = [merged]
+            document["bundle"] = bundle
+            document["plan"] = (
+                "Apply every section, directory, and removal goal in this single update. "
+                "The source edits are listed in bundle.selected."
+            )
+            reasoning = str(document.get("reasoning") or "").strip()
+            document["reasoning"] = (
+                f"{reasoning}\n\nThis update merges {len(selected)} edits of "
+                f"{', '.join(affected)} into one optimize, verify, and judge pass."
+            ).strip()
+            path = Path(representative["op_goal"])
+            path.write_text(
+                json.dumps(document, indent=2, ensure_ascii=False) + "\n"
+            )
+            pipeline_contracts.validate_goal(path, exactly_one_op=True)
+            input_path = path.parent / "verification-input.json"
+            if input_path.is_file():
+                existing_input = json.loads(input_path.read_text())
+                materialize_verification_input(
+                    workspace,
+                    document,
+                    merged,
+                    str(existing_input.get("run_id") or ""),
+                    str(representative["cluster"]),
+                    int(representative["op_index"]),
+                    out=input_path,
+                )
+            representative = {
+                **representative,
+                "op": merged,
+                "bundle": bundle,
+                "bundled_sources": [
+                    {"cluster": task["cluster"], "op_index": task["op_index"]}
+                    for task in selected
+                ],
+            }
+        for task, reason in dropped:
+            consumed.add(id(task))
+            skip_operation_phases(
+                workspace,
+                str(task["cluster"]),
+                int(task["op_index"]),
+                ("optimize", "verification", "judge"),
+                reason,
+            )
+            finalize_unexecuted_operation(
+                workspace,
+                str(task["cluster"]),
+                int(task["op_index"]),
+                status="skipped",
+                reason=reason,
+            )
+            write_publication(
+                workspace,
+                str(task["cluster"]),
+                int(task["op_index"]),
+                accepted=False,
+                reason=reason,
+            )
+            annotations.append(
+                {
+                    "cluster": task["cluster"],
+                    "op_index": task["op_index"],
+                    "decision": reason,
+                    "confidence": (task.get("rank") or {}).get(
+                        "confidence", task.get("confidence", 0)
+                    ),
+                    "score": (task.get("rank") or {}).get("score", 0),
+                    "super_score": (task.get("rank") or {}).get("super_score", 0),
+                }
+            )
+        if len(selected) > 1:
+            for task in selected:
+                consumed.add(id(task))
+            replacements[id(selected[0])] = representative
+            for task in selected[1:]:
+                bundled_reason = (
+                    "bundled into "
+                    f"{representative['cluster']} op "
+                    f"{representative['op_index']}"
+                )
+                skip_operation_phases(
+                    workspace,
+                    str(task["cluster"]),
+                    int(task["op_index"]),
+                    ("optimize", "verification", "judge"),
+                    bundled_reason,
+                )
+                finalize_unexecuted_operation(
+                    workspace,
+                    str(task["cluster"]),
+                    int(task["op_index"]),
+                    status="skipped",
+                    reason=bundled_reason,
+                )
+                annotations.append(
+                    {
+                        "cluster": task["cluster"],
+                        "op_index": task["op_index"],
+                        "decision": "bundled",
+                        "selected_cluster": representative["cluster"],
+                        "selected_op_index": representative["op_index"],
+                        "confidence": task.get("confidence", 0),
+                    }
+                )
+            annotations.append(
+                {
+                    "cluster": representative["cluster"],
+                    "op_index": representative["op_index"],
+                    "decision": "selected",
+                    "bundle_size": len(selected),
+                    "bundled_skills": list(affected),
+                    "super_score": (representative.get("rank") or {}).get(
+                        "super_score", 0
+                    ),
+                }
+            )
+    result: list[dict[str, object]] = []
+    emitted: set[int] = set()
+    for task in tasks:
+        identity = id(task)
+        if identity in replacements and identity not in emitted:
+            result.append(replacements[identity])
+            emitted.add(identity)
+        elif identity not in consumed:
+            result.append(task)
+    if annotations:
+        path = workspace / "run/goal-reduction.json"
+        document = (
+            json.loads(path.read_text())
+            if path.is_file()
+            else {"schema_version": 1, "decisions": []}
+        )
+        rows = {
+            (row.get("cluster"), row.get("op_index")): row
+            for row in document.get("decisions") or []
+            if isinstance(row, dict)
+        }
+        for annotation in annotations:
+            key = (annotation["cluster"], annotation["op_index"])
+            row = rows.get(key)
+            if row is None:
+                document.setdefault("decisions", []).append(annotation)
+                rows[key] = annotation
+            else:
+                row.update(annotation)
+        document["max_ops_per_skill"] = max_ops
+        document["selected_operation_count"] = len(result)
+        atomic_write_json(path, document)
+    return result
+
+
+def operation_batches(tasks: list[dict[str, object]]) -> list[list[dict[str, object]]]:
+    pending = list(tasks)
+    batches: list[list[dict[str, object]]] = []
+    while pending:
+        batch: list[dict[str, object]] = []
+        deferred: list[dict[str, object]] = []
+        used: set[str] = set()
+        for task in pending:
+            affected = set(task["conflicts"])
+            conflicts = (
+                "*" in affected
+                or "*" in used
+                or bool(affected.intersection(used))
+            )
+            if conflicts:
+                deferred.append(task)
+                continue
+            batch.append(task)
+            used.update(affected)
+        if not batch:
+            batch = [deferred.pop(0)]
+        batches.append(batch)
+        pending = deferred
+    return batches
+
+
+def _rank_fields(task: dict[str, object]) -> dict[str, object]:
+    rank = task.get("rank")
+    if not isinstance(rank, dict):
+        return {}
+    return {
+        key: rank.get(key)
+        for key in ("severity", "confidence", "score", "match_score", "super_score")
+    }
+
+
+def reduce_operation_tasks(
+    workspace: Path, tasks: list[dict[str, object]]
+) -> list[dict[str, object]]:
+    with pipeline_metrics.span(
+        metrics_workspace(workspace),
+        "reduce-goals",
+        workspace.name,
+        "orchestration",
+        metadata={"input_operations": len(tasks)},
+    ):
+        return _reduce_operation_tasks(workspace, tasks)
+
+
+def _reduce_operation_tasks(
+    workspace: Path, tasks: list[dict[str, object]]
+) -> list[dict[str, object]]:
+    input_operation_count = len(tasks)
+    def create_resource_identity(task: dict[str, object]) -> tuple[str, str] | None:
+        op = task.get("op")
+        if not isinstance(op, dict) or op.get("op") != "create":
+            return None
+        finding_path = (
+            workspace
+            / "traces/derived/findings"
+            / str(task.get("cluster") or "")
+            / "finding.json"
+        )
+        try:
+            finding = json.loads(finding_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return None
+        features = finding.get("features") if isinstance(finding, dict) else None
+        if not isinstance(features, dict) or features.get("candidate_source") != "resource_opportunity":
+            return None
+        resource = str(features.get("resource") or "")
+        contract = features.get(f"{resource[:-1] if resource.endswith('s') else resource}_contract")
+        contract = contract if isinstance(contract, dict) else {}
+        if resource == "assets":
+            source = str(contract.get("source") or "").casefold().strip()
+        elif resource == "references":
+            source = str(contract.get("source") or "").casefold().strip()
+        else:
+            source = str(features.get("resource_family") or "").casefold().strip()
+        return (resource, source) if resource and source else None
+
+    def resource_create_quality(task: dict[str, object]) -> tuple[int, float, float, str]:
+        finding_path = (
+            workspace
+            / "traces/derived/findings"
+            / str(task.get("cluster") or "")
+            / "finding.json"
+        )
+        try:
+            finding = json.loads(finding_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            finding = {}
+        features = finding.get("features") if isinstance(finding, dict) else {}
+        contract = (features or {}).get("asset_contract") if isinstance(features, dict) else {}
+        content = str((contract or {}).get("content") or "") if isinstance(contract, dict) else ""
+        structured_keys = len(set(re.findall(r"(?:^|\s)([a-z_][a-z0-9_-]*)\s*:", content)))
+        return (
+            structured_keys,
+            float(finding.get("confidence") or 0) if isinstance(finding, dict) else 0.0,
+            float(finding.get("score") or 0) if isinstance(finding, dict) else 0.0,
+            str(task.get("cluster") or ""),
+        )
+
+    collision_groups: dict[tuple[str, str], list[dict[str, object]]] = {}
+    for task in tasks:
+        identity = create_resource_identity(task)
+        if identity is not None:
+            collision_groups.setdefault(identity, []).append(task)
+    suppressed_ids: set[int] = set()
+    collision_decisions: list[dict[str, object]] = []
+    for identity, group in collision_groups.items():
+        if len(group) < 2:
+            continue
+        winner = max(group, key=resource_create_quality)
+        for task in group:
+            if task is winner:
+                continue
+            suppressed_ids.add(id(task))
+            reason = (
+                "overlapping resource create; selected richer proposal from "
+                f"{winner['cluster']} op {winner['op_index']}"
+            )
+            skip_operation_phases(
+                workspace,
+                str(task["cluster"]),
+                int(task["op_index"]),
+                ("optimize", "verification", "judge"),
+                reason,
+            )
+            finalize_unexecuted_operation(
+                workspace,
+                str(task["cluster"]),
+                int(task["op_index"]),
+                status="skipped",
+                reason=reason,
+            )
+            write_publication(
+                workspace,
+                str(task["cluster"]),
+                int(task["op_index"]),
+                accepted=False,
+                reason="overlapping-resource-create",
+            )
+            collision_decisions.append(
+                {
+                    "cluster": task["cluster"],
+                    "op_index": task["op_index"],
+                    "decision": "overlapping-resource-create",
+                    "resource": identity[0],
+                    "resource_identity": identity[1],
+                    "selected_cluster": winner["cluster"],
+                    "selected_op_index": winner["op_index"],
+                }
+            )
+    tasks = [task for task in tasks if id(task) not in suppressed_ids]
+    selected: list[dict[str, object]] = []
+    seen: dict[str, dict[str, object]] = {}
+    decisions: list[dict[str, object]] = []
+    for task in tasks:
+        signature = hashlib.sha256(
+            json.dumps(
+                task["op"],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        first = seen.get(signature)
+        if first is None:
+            seen[signature] = task
+            selected.append(task)
+            decisions.append(
+                {
+                    "cluster": task["cluster"],
+                    "op_index": task["op_index"],
+                    "signature": signature,
+                    "decision": "selected",
+                    **_rank_fields(task),
+                }
+            )
+        else:
+            duplicate_reason = (
+                "duplicate of "
+                f"{first['cluster']} op {first['op_index']}"
+            )
+            skip_operation_phases(
+                workspace,
+                str(task["cluster"]),
+                int(task["op_index"]),
+                ("optimize", "verification", "judge"),
+                duplicate_reason,
+            )
+            finalize_unexecuted_operation(
+                workspace,
+                str(task["cluster"]),
+                int(task["op_index"]),
+                status="skipped",
+                reason=duplicate_reason,
+            )
+            write_publication(
+                workspace,
+                str(task["cluster"]),
+                int(task["op_index"]),
+                accepted=False,
+                reason="duplicate",
+            )
+            decisions.append(
+                {
+                    "cluster": task["cluster"],
+                    "op_index": task["op_index"],
+                    "signature": signature,
+                    "decision": "duplicate",
+                    "selected_cluster": first["cluster"],
+                    "selected_op_index": first["op_index"],
+                    **_rank_fields(task),
+                }
+            )
+    atomic_write_json(
+        workspace / "run/goal-reduction.json",
+        {
+            "schema_version": 1,
+            "input_operation_count": input_operation_count,
+            "selected_operation_count": len(selected),
+            "retry_budget": RETRY_BUDGET,
+            "max_attempts": RETRY_BUDGET + 1,
+            "decisions": collision_decisions + decisions,
+        },
+    )
+    return selected
+
+
+def merge_metadata(
+    workspace: Path, worker: Path, affected: set[str]
+) -> Path:
+    relative = Path("target/to_be_improved_skills_metadata/metadata.json")
+    detach_skill_changelogs(workspace)
+    detach_skill_changelogs(worker)
+    main_path = workspace / relative
+    worker_path = worker / relative
+    main = json.loads(main_path.read_text())
+    candidate = json.loads(worker_path.read_text())
+    kept = [
+        row
+        for row in main.get("skills_metadata") or []
+        if isinstance(row, dict) and row.get("skill") not in affected
+    ]
+    changed = [
+        row
+        for row in candidate.get("skills_metadata") or []
+        if isinstance(row, dict) and row.get("skill") in affected
+    ]
+    kept.extend(changed)
+    kept.sort(key=lambda row: str(row.get("skill", "")).casefold())
+    main["skills_metadata"] = kept
+    atomic_write_json(main_path, main)
+    return main_path
+
+
+def skill_content_sha256(directory: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(
+        (value for value in directory.rglob("*") if value.is_file()),
+        key=lambda value: value.relative_to(directory).as_posix(),
+    ):
+        relative = path.relative_to(directory).as_posix().encode()
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        content = path.read_bytes()
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return digest.hexdigest()
+
+
+def _operation_change_claims(op: dict, skill: str) -> tuple[list[str], list[str]]:
+    sections: set[str] = set()
+    directories: set[str] = set()
+
+    def collect(values: object, field: str, target: set[str]) -> None:
+        if not isinstance(values, list):
+            return
+        for value in values:
+            if isinstance(value, str) and value.strip():
+                target.add(value.strip())
+            elif isinstance(value, dict):
+                name = value.get(field)
+                if isinstance(name, str) and name.strip():
+                    target.add(name.strip())
+
+    def walk(value: object) -> None:
+        if isinstance(value, dict):
+            if value.get("skill") == skill:
+                collect(value.get("sections"), "section", sections)
+                collect(value.get("dirs"), "dir", directories)
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(op)
+    return sorted(sections), sorted(directories)
+
+
+OPERATION_PHASES = ("goal", "optimize", "verification", "judge")
+
+
+def _operation_changelog_path(
+    workspace: Path, finding_id: str, op_index: int
+) -> Path:
+    return (
+        workspace
+        / "run"
+        / finding_id
+        / "ops"
+        / str(op_index)
+        / "changelog.json"
+    )
+
+
+def _phase_marker(
+    phase: str,
+    status: str,
+    reason: str | None = None,
+) -> dict[str, object]:
+    now = datetime.now(UTC)
+    marker: dict[str, object] = {
+        "phase": phase,
+        "status": status,
+        "date": now.date().isoformat(),
+        "at": now.isoformat(),
+    }
+    if reason:
+        marker["reason"] = reason
+    return marker
+
+
+def initialize_operation_changelog(
+    workspace: Path,
+    op: dict,
+    run_id: str,
+    finding_id: str,
+    op_index: int,
+) -> Path:
+    """Create the phase journal as soon as the operation goal exists."""
+    raw = workspace / "target/raw_skills"
+    improved = workspace / "target/to_be_improved_skills"
+    changed_on = datetime.now(UTC).date().isoformat()
+    changes = []
+    for skill in skill_names_mod.skill_names(op):
+        before_dir = raw / skill
+        after_dir = improved / skill
+        sections, directories = _operation_change_claims(op, skill)
+        changes.append(
+            {
+                "id": f"{run_id}:{finding_id}:{op_index}:{skill}",
+                "skill": skill,
+                "operation": str(op.get("op") or ""),
+                "run_id": run_id,
+                "finding_id": finding_id,
+                "op_index": op_index,
+                "date": changed_on,
+                "sections": sections,
+                "directories": directories,
+                "before_sha256": (
+                    skill_content_sha256(before_dir)
+                    if before_dir.is_dir()
+                    else None
+                ),
+                "after_sha256": (
+                    skill_content_sha256(after_dir)
+                    if after_dir.is_dir()
+                    else None
+                ),
+                "status": "pending",
+            }
+        )
+    phase_markers = [
+        _phase_marker("goal", "completed"),
+        *[
+            _phase_marker(phase, "pending")
+            for phase in OPERATION_PHASES[1:]
+        ],
+    ]
+    document = {
+        "schema_version": 1,
+        "changes": changes,
+        "phase_markers": phase_markers,
+        "phase_events": copy.deepcopy(phase_markers),
+    }
+    path = _operation_changelog_path(workspace, finding_id, op_index)
+    atomic_write_json(path, document)
+    return path
+
+
+def mark_operation_phase(
+    workspace: Path,
+    finding_id: str,
+    op_index: int,
+    phase: str,
+    status: str,
+    reason: str | None = None,
+) -> None:
+    path = _operation_changelog_path(workspace, finding_id, op_index)
+    if not path.is_file():
+        raise SystemExit(f"operation changelog was not initialized: {path}")
+    document = json.loads(path.read_text())
+    markers = document.get("phase_markers")
+    if not isinstance(markers, list):
+        raise SystemExit(f"operation changelog has no phase markers: {path}")
+    replacement = _phase_marker(phase, status, reason)
+    for index, marker in enumerate(markers):
+        if isinstance(marker, dict) and marker.get("phase") == phase:
+            markers[index] = replacement
+            break
+    else:
+        markers.append(replacement)
+    events = document.setdefault("phase_events", [])
+    if not isinstance(events, list):
+        raise SystemExit(f"operation changelog has invalid phase events: {path}")
+    events.append(copy.deepcopy(replacement))
+    atomic_write_json(path, document)
+    active = workspace / "run/changelog.json"
+    if active.is_file():
+        atomic_write_json(active, document)
+
+
+def skip_operation_phases(
+    workspace: Path,
+    finding_id: str,
+    op_index: int,
+    phases: tuple[str, ...],
+    reason: str,
+) -> None:
+    for phase in phases:
+        mark_operation_phase(
+            workspace, finding_id, op_index, phase, "skipped", reason
+        )
+
+
+def materialize_operation_changelog(
+    workspace: Path,
+    op: dict,
+    run_id: str,
+    finding_id: str,
+    op_index: int,
+) -> Path:
+    """Record claimed changes and content hashes before verification."""
+    raw = workspace / "target/raw_skills"
+    improved = workspace / "target/to_be_improved_skills"
+    operation = str(op.get("op") or "")
+    archive = _operation_changelog_path(workspace, finding_id, op_index)
+    existing = json.loads(archive.read_text()) if archive.is_file() else {}
+    changed_on = datetime.now(UTC).date().isoformat()
+    changes: list[dict[str, object]] = []
+    for skill in skill_names_mod.skill_names(op):
+        before_dir = raw / skill
+        after_dir = improved / skill
+        sections, directories = _operation_change_claims(op, skill)
+        changes.append(
+            {
+                "id": f"{run_id}:{finding_id}:{op_index}:{skill}",
+                "skill": skill,
+                "operation": operation,
+                "run_id": run_id,
+                "finding_id": finding_id,
+                "op_index": op_index,
+                "date": changed_on,
+                "sections": sections,
+                "directories": directories,
+                "before_sha256": (
+                    skill_content_sha256(before_dir)
+                    if before_dir.is_dir()
+                    else None
+                ),
+                "after_sha256": (
+                    skill_content_sha256(after_dir)
+                    if after_dir.is_dir()
+                    else None
+                ),
+                "status": "pending",
+            }
+        )
+
+    fallback_markers = [
+        _phase_marker("goal", "completed"),
+        *[
+            _phase_marker(phase, "pending")
+            for phase in OPERATION_PHASES[1:]
+        ],
+    ]
+    document = {
+        "schema_version": 1,
+        "changes": changes,
+        "phase_markers": existing.get("phase_markers")
+        or fallback_markers,
+        "phase_events": existing.get("phase_events")
+        or copy.deepcopy(fallback_markers),
+    }
+    path = workspace / "run/changelog.json"
+    atomic_write_json(path, document)
+    atomic_write_json(archive, document)
+    mark_operation_phase(
+        workspace, finding_id, op_index, "optimize", "completed"
+    )
+    for change in changes:
+        skill = change.get("skill")
+        line = _operation_line(change)
+        if isinstance(skill, str) and line:
+            append_changelog_lines(
+                workspace / SKILL_CHANGELOG_DIR, skill, [line]
+            )
+    return path
+
+
+def _verification_requirements(op: dict, skill: str, avoid: object) -> dict:
+    sections: list[dict[str, str]] = []
+    directories: list[dict[str, str]] = []
+    removals: list[str] = []
+
+    def collect(values: object, name_key: str, output_key: str) -> None:
+        if not isinstance(values, list):
+            return
+        for value in values:
+            if not isinstance(value, dict):
+                continue
+            name = value.get(name_key)
+            goal = value.get("goal")
+            if isinstance(name, str) and name and isinstance(goal, str) and goal:
+                target = sections if output_key == "section" else directories
+                target.append({output_key: name, "expectation": goal})
+
+    def walk(value: object) -> None:
+        if isinstance(value, dict):
+            if value.get("skill") == skill:
+                collect(value.get("sections"), "section", "section")
+                collect(value.get("dirs"), "dir", "directory")
+                removals.extend(
+                    item.strip()
+                    for item in value.get("remove") or []
+                    if isinstance(item, str) and item.strip()
+                )
+                reason = value.get("reason")
+                if op.get("op") == "delete" and isinstance(reason, str) and reason:
+                    removals.append(f"entire skill: {reason}")
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(op)
+    avoid_items = (
+        [avoid]
+        if isinstance(avoid, str) and avoid
+        else [item for item in avoid if isinstance(item, str) and item]
+        if isinstance(avoid, list)
+        else []
+    )
+    return {
+        "sections": sections,
+        "directories": directories,
+        "avoid": avoid_items,
+        "removals": removals,
+    }
+
+
+def _verification_skill_role(op: dict, skill: str) -> tuple[str, bool, bool]:
+    operation = op.get("op")
+    if operation == "create":
+        return "created", False, True
+    if operation == "update":
+        return "updated", True, True
+    if operation == "delete":
+        return "deleted", True, False
+    if operation == "merge":
+        target = (op.get("into") or {}).get("skill")
+        if skill == target:
+            sources = op.get("skills") or []
+            return "merge_target", skill in sources, True
+        return "merge_source", True, False
+    if operation == "split":
+        source = op.get("skill")
+        targets = {
+            row.get("skill")
+            for row in op.get("into") or []
+            if isinstance(row, dict)
+        }
+        if skill in targets:
+            return "split_target", skill == source, True
+        return "split_source", True, False
+    raise pipeline_contracts.ContractError(
+        f"cannot build verification role for operation {operation!r}"
+    )
+
+
+def _append_goal_verification_assertions(document: dict) -> None:
+    definitions = document.get("checks") or {}
+    skill_checks: dict[str, dict[str, dict[str, object]]] = {}
+    for row in document.get("skills") or []:
+        if not isinstance(row, dict) or not isinstance(row.get("skill"), str):
+            continue
+        role = row.get("role")
+        materialized = [
+            {
+                "id": step_id,
+                "definition_ref": f"#/checks/{step_id}",
+                "applicable": role in (definition.get("applies_to") or []),
+                "assertions": [],
+            }
+            for step_id, definition in definitions.items()
+            if isinstance(definition, dict)
+        ]
+        row["checks"] = materialized
+        skill_checks[row["skill"]] = {
+            str(check["id"]): check for check in materialized
+        }
+
+    def append(
+        step_id: str,
+        skill: str,
+        source_ref: str,
+        text: str,
+    ) -> None:
+        digest = hashlib.sha256(
+            f"{step_id}:{skill}:{source_ref}:{text}".encode()
+        ).hexdigest()[:12]
+        skill_checks[skill][step_id]["assertions"].append(
+            {
+                "id": f"{step_id}-goal-{digest}",
+                "text": text,
+                "source_ref": source_ref,
+            }
+        )
+
+    for skill_index, row in enumerate(document.get("skills") or []):
+        if not isinstance(row, dict) or not isinstance(row.get("skill"), str):
+            continue
+        skill = row["skill"]
+        requirements = row.get("requirements") or {}
+        base = f"#/skills/{skill_index}/requirements"
+        for key, name_key, label in (
+            ("sections", "section", "Section"),
+            ("directories", "directory", "Directory"),
+        ):
+            for index, requirement in enumerate(requirements.get(key) or []):
+                if not isinstance(requirement, dict):
+                    continue
+                name = requirement.get(name_key)
+                expectation = requirement.get("expectation")
+                append(
+                    "step2",
+                    skill,
+                    f"{base}/{key}/{index}",
+                    f"{label} {name}: {expectation}",
+                )
+        for index, expectation in enumerate(requirements.get("avoid") or []):
+            append(
+                "step2",
+                skill,
+                f"{base}/avoid/{index}",
+                f"Forbidden outcome is absent: {expectation}",
+            )
+        for index, expectation in enumerate(
+            requirements.get("removals") or []
+        ):
+            source_ref = f"{base}/removals/{index}"
+            append(
+                "step2",
+                skill,
+                source_ref,
+                f"Required removal is applied: {expectation}",
+            )
+            append(
+                "step8",
+                skill,
+                source_ref,
+                f"Obsolete or redundant information is absent: {expectation}",
+            )
+
+
+DETECTOR_ABSTRACTION = re.compile(r"<([a-z][a-z0-9_-]*)>", re.IGNORECASE)
+
+
+def encode_detector_abstractions(value: object) -> object:
+    """Keep detector-normalized tokens without leaking authoring placeholders."""
+    if isinstance(value, dict):
+        return {
+            key: encode_detector_abstractions(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [encode_detector_abstractions(item) for item in value]
+    if isinstance(value, str):
+        return DETECTOR_ABSTRACTION.sub(
+            lambda match: f"ABSTRACT_{match.group(1).upper()}", value
+        )
+    return value
+
+
+def materialize_verification_input(
+    workspace: Path,
+    goal: dict,
+    op: dict,
+    run_id: str,
+    finding_id: str,
+    op_index: int,
+    out: Path | None = None,
+) -> Path:
+    """Build explicit, operation-scoped expectations for every verifier step."""
+    finding_path = (
+        workspace
+        / "traces"
+        / "derived"
+        / "findings"
+        / finding_id
+        / "finding.json"
+    )
+    finding = (
+        json.loads(finding_path.read_text())
+        if finding_path.is_file()
+        else {}
+    )
+    features = finding.get("features") or {}
+    quality = features.get("quality") or {}
+    policy = preprocessing_config().get("evolution_policy") or {}
+    avoid = (goal.get("goal") or {}).get("avoid")
+    skills = []
+    for skill in skill_names_mod.skill_names(op):
+        role, baseline_expected, candidate_expected = _verification_skill_role(
+            op, skill
+        )
+        skills.append(
+            {
+                "skill": skill,
+                "role": role,
+                "baseline_expected": baseline_expected,
+                "candidate_expected": candidate_expected,
+                "requirements": _verification_requirements(op, skill, avoid),
+            }
+        )
+    document = json.loads(VERIFICATION_INPUT_TEMPLATE.read_text())
+    document.update(
+        {
+            "run_id": run_id,
+            "finding_id": finding_id,
+            "op_index": op_index,
+            "operation": str(op.get("op") or ""),
+            "skills": skills,
+        }
+    )
+    _append_goal_verification_assertions(document)
+    finding_ids = [finding_id]
+    bundle = goal.get("bundle") if isinstance(goal.get("bundle"), dict) else {}
+    for selected in bundle.get("selected") or []:
+        source_id = selected.get("cluster") if isinstance(selected, dict) else None
+        if isinstance(source_id, str) and source_id not in finding_ids:
+            finding_ids.append(source_id)
+    bundled_findings: list[dict[str, object]] = []
+    for source_id in finding_ids:
+        source_path = (
+            workspace
+            / "traces"
+            / "derived"
+            / "findings"
+            / source_id
+            / "finding.json"
+        )
+        source = json.loads(source_path.read_text()) if source_path.is_file() else {}
+        source_features = source.get("features") or {}
+        bundled_findings.append(
+            {
+                "finding_id": source_id,
+                "path": (
+                    f"traces/derived/findings/{source_id}/finding.json"
+                    if source_path.is_file()
+                    else None
+                ),
+                "candidate_source": source_features.get("candidate_source"),
+                "confidence": source.get("confidence"),
+                "evidence_records": len(source.get("evidence") or []),
+                "distinct_windows": source_features.get("distinct_windows"),
+                "lesson": encode_detector_abstractions(
+                    source_features.get("lesson")
+                ),
+            }
+        )
+    document["checks"]["step3"]["evidence"] = {
+        "findings": bundled_findings,
+    }
+    document["checks"]["step4"]["thresholds"] = {
+        "min_methodology_value": policy.get("min_methodology_value", 0.08),
+        "methodology_value": quality.get("value"),
+    }
+    document["checks"]["step7"]["thresholds"] = {
+        "novelty_max_similarity": policy.get(
+            "novelty_max_similarity", 0.82
+        )
+    }
+    path = out or workspace / "run/verification-input.json"
+    atomic_write_json(path, document)
+    pipeline_contracts.validate_verification_input(path)
+    return path
+
+
+def _artifact_reference(path: Path) -> dict[str, str]:
+    return {
+        "path": path.name,
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+
+
+def _reindex_single_skill_refs(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            key: _reindex_single_skill_refs(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_reindex_single_skill_refs(item) for item in value]
+    if isinstance(value, str):
+        return re.sub(r"(#?/skills/)\d+/", r"\g<1>0/", value)
+    return value
+
+
+def verifier_skill_payloads(
+    verification_input: dict[str, object],
+    output_skeleton: dict[str, object],
+    skill: str,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Create the concrete input and required output shape for one skill."""
+    input_rows = [
+        row
+        for row in verification_input.get("skills") or []
+        if isinstance(row, dict) and row.get("skill") == skill
+    ]
+    step_rows = [
+        row
+        for row in output_skeleton.get("verification_steps") or []
+        if isinstance(row, dict) and row.get("skill") == skill
+    ]
+    feedback = output_skeleton.get("feedback")
+    feedback_rows = [
+        row
+        for row in (feedback or {}).get("per_skill") or []
+        if isinstance(row, dict) and row.get("skill") == skill
+    ]
+    if len(input_rows) != 1 or len(step_rows) != 1 or len(feedback_rows) != 1:
+        raise pipeline_contracts.ContractError(
+            f"cannot materialize exactly one verifier payload for {skill}"
+        )
+    skill_input = copy.deepcopy(verification_input)
+    skill_input["skills"] = input_rows
+    skill_input = _reindex_single_skill_refs(skill_input)
+    input_text = json.dumps(skill_input, indent=2, ensure_ascii=False) + "\n"
+
+    required_output = copy.deepcopy(output_skeleton)
+    required_output["verification_input"] = {
+        "path": "verification-input.json",
+        "sha256": hashlib.sha256(input_text.encode()).hexdigest(),
+    }
+    required_output["verification_steps"] = step_rows
+    required_output["verification_steps"] = _reindex_single_skill_refs(
+        required_output["verification_steps"]
+    )
+    required_output["changelog"] = [
+        row
+        for row in required_output.get("changelog") or []
+        if isinstance(row, dict) and row.get("skill") == skill
+    ]
+    required_feedback = required_output["feedback"]
+    required_feedback["bottleneck_skills"] = [skill]
+    required_feedback["per_skill"] = feedback_rows
+    required_feedback["ood"] = []
+    required_feedback["action"] = None
+    return skill_input, required_output
+
+
+def _prompt_lesson(lesson: object) -> object:
+    """Keep the reusable rule and drop per-event retry rows from the prompt."""
+    if not isinstance(lesson, dict) or "retry_classifications" not in lesson:
+        return lesson
+    compact = {
+        key: value
+        for key, value in lesson.items()
+        if key != "retry_classifications"
+    }
+    return compact or {"kind": lesson.get("kind")}
+
+
+def _prompt_verification_input(
+    verification_input: dict[str, object],
+) -> dict[str, object]:
+    document = copy.deepcopy(verification_input)
+    scoring = document.get("scoring")
+    if isinstance(scoring, dict):
+        # The runner owns aggregation and pricing. The model only needs the
+        # pass threshold; formulas, weights, anchors, and duplicated prose add
+        # prompt tokens without changing its exception decision.
+        document["scoring"] = {
+            "pass_threshold": scoring.get("pass_threshold"),
+        }
+    checks = document.get("checks")
+    if isinstance(checks, dict):
+        for check in checks.values():
+            if isinstance(check, dict):
+                check.pop("inputs", None)
+                check.pop("applies_to", None)
+    for skill_row in document.get("skills") or []:
+        if not isinstance(skill_row, dict):
+            continue
+        for check in skill_row.get("checks") or []:
+            if isinstance(check, dict):
+                check.pop("definition_ref", None)
+    findings = (
+        ((document.get("checks") or {}).get("step3") or {}).get("evidence") or {}
+    ).get("findings")
+    if isinstance(findings, list):
+        for row in findings:
+            if isinstance(row, dict) and "lesson" in row:
+                row["lesson"] = _prompt_lesson(row["lesson"])
+    return document
+
+
+def verifier_response_prompt(
+    skill: str,
+    verification_input: dict[str, object],
+    required_output: dict[str, object],
+    *,
+    evidence_bundle: str = "",
+    previous_error: str | None = None,
+) -> str:
+    correction = (
+        "\nYour previous response was rejected by the JSON/contract parser:\n"
+        f"{previous_error}\nReturn a corrected complete JSON object.\n"
+        if previous_error
+        else ""
+    )
+    verification_input = _prompt_verification_input(verification_input)
+    compact_shape = {
+        "skill": skill,
+        "failures": [
+            {
+                "assertion_id": "<only a failed assertion id from the input>",
+                "reasoning": "<why it failed>",
+                "evidence": ["<concrete observed evidence>"],
+            }
+        ],
+        "penalties": [{"id": "<configured penalty id>", "target": "<target>"}],
+        "feedback": "<concise overall assessment>",
+        "replay": {
+            "available": False,
+            "kind": "targeted_detector",
+            "status": "not_run",
+            "reason": "No post-edit replay was provided.",
+            "before": None,
+            "after": None,
+        },
+        "ood": [],
+    }
+    return f"""Verify exactly one skill: {skill}. One-pass decision; use no tools.
+
+The host already collected the authoritative filesystem evidence below. Do
+not read files, explore the workspace, run commands, edit skills, or write
+verification.json. Judge only whether that evidence satisfies the concrete
+input. The runner performs schema validation, scoring, hashes, and aggregation.
+
+Mechanical standards. These are the defects the decision score prices. Apply
+them from this list and from one run of verify_sections.py and verify_goal.py.
+A script finding is one listed penalty, not a veto. Do not open the checker
+source or the parent repository to re-derive them.
+
+- Section match: for this one skill, match a claimed name with a loose regex.
+  Case, extra words, and heading level do not matter. `overview`,
+  `## Overview`, and `# Overview` are the same name. Pass that claim when its
+  content is new, deleted, or changed in the direction of the goal. That is
+  enough. Do not fail it because the wording is tighter than the goal, including
+  "all of the following are true", when the goal's cases are present.
+- Frontmatter: YAML between `---` lines. `name` is lowercase hyphen-case,
+  matches the skill directory, and is at most 64 characters. `description` is
+  required, at most 1024 characters, and contains no angle brackets. Allowed
+  fields are name, description, license, compatibility, allowed-tools, and
+  metadata.
+- Shape: SKILL.md is at most 500 lines. No `TODO`, `[TODO`, `EXAMPLE_SCRIPT`,
+  `EXAMPLE_REFERENCE`, or `EXAMPLE_ASSET` placeholder. No symbolic links. No
+  file over 10MB. Reference files are one directory level deep. A named
+  `scripts/*.py` file must compile. A named `evals` directory must contain
+  `evals/evals.json`, including the positive and near-miss cases the goal
+  requires. Directories are only references, scripts, agents, assets, evals,
+  or a goal-named other/ood directory.
+- Edit diff: create must contain every claimed section and directory. Update
+  must change every claimed section and leave frontmatter, the text before the
+  first heading, and every unclaimed section identical to target/raw_skills.
+  Both copies must exist. Delete removes the skill directory. A merge target
+  may rewrite sections needed to preserve its named source capabilities; do
+  not apply the narrow-update unchanged-section rule to it. Merge and split
+  keep the source snapshot and remove only the sources the operation names.
+  Evaluate duplication against the exact named sources and target, not an
+  unrelated inventory skill with a semantically similar description.
+- Hashes: changelog.json already stores the before and after content hashes.
+  Do not reimplement that digest.
+- Decision: list each defect once in feedback.per_skill[].penalties as
+  {{"id", "target"}}. The runner prices that list and writes the skill score
+  and status. Do not fold a penalty into an assertion average or a step
+  weight. The score starts at 1.0. The sections and directories this goal
+  names share a 0.80 claim budget; do not charge a section or directory the
+  goal did not name. The 8 core sections are the inventory, not the divisor.
+  missing_section, missing_directory, and goal_contradiction each cost one
+  share of that budget. missing_near_miss_eval costs half a share.
+  heading_level, unclaimed_heading, tighter_wording, and description_shape
+  each cost 0.05, and those shape charges stop at 0.20, so shape alone stays
+  at or above 0.80 and still passes. replay_fail costs 0.125. The runner adds
+  it when replay status is fail, and one replay failure still passes. Pass
+  when the priced score is at least pass_threshold.
+
+The concrete verification input for this skill is part of this prompt:
+<verification-input-json>
+{json.dumps(verification_input, indent=2, ensure_ascii=False)}
+</verification-input-json>
+
+Authoritative evidence bundle:
+<skill-evidence>
+{evidence_bundle or "No textual candidate evidence was required for this role."}
+</skill-evidence>
+
+The runner owns the full verification document. Return only this compact
+exception report; do not copy passing assertions or runner-owned fields:
+<compact-verdict-json>
+{json.dumps(compact_shape, indent=2, ensure_ascii=False)}
+</compact-verdict-json>
+
+`failures` contains only failed assertion IDs from the concrete input. Use an
+empty list when every assertion passes. List every priced defect exactly once
+in `penalties`; a failure requires a corresponding penalty. Preserve the
+replay object unless you actually ran a measured replay. Return only one JSON
+object, without Markdown fences or explanatory text. The runner expands it
+into the complete required output and validates the normal contract.
+Optimization retries remain disabled; a runner may repeat this same request
+only when your response is malformed JSON or violates the compact or expanded
+output contract.{correction}"""
+
+
+def verifier_evidence_bundle(
+    workspace: Path, skill_row: dict[str, object], *, max_chars: int = 26000
+) -> str:
+    """Materialize bounded, exact evidence so the verifier needs no tools."""
+    skill = str(skill_row.get("skill") or "")
+    raw = workspace / "target/raw_skills" / skill
+    candidate = workspace / "target/to_be_improved_skills" / skill
+    lines = [
+        f"skill: {skill}",
+        f"role: {skill_row.get('role')}",
+        f"baseline_exists: {raw.is_dir()}",
+        f"candidate_exists: {candidate.is_dir()}",
+    ]
+
+    def read_text(path: Path) -> str:
+        try:
+            return path.read_text(errors="replace")
+        except OSError:
+            return ""
+
+    before = read_text(raw / "SKILL.md") if raw.is_dir() else ""
+    after = read_text(candidate / "SKILL.md") if candidate.is_dir() else ""
+    if raw.is_dir() and candidate.is_dir():
+        heading = re.compile(r"^##\s+(.+?)\s*$", re.MULTILINE)
+
+        def sections(document: str) -> tuple[str, dict[str, str]]:
+            matches = list(heading.finditer(document))
+            preamble = document[: matches[0].start()] if matches else document
+            values: dict[str, str] = {}
+            for index, match in enumerate(matches):
+                end = matches[index + 1].start() if index + 1 < len(matches) else len(document)
+                key = re.sub(r"[^a-z0-9]+", "_", match.group(1).lower()).strip("_")
+                values[key] = document[match.start():end].strip()
+            return preamble, values
+
+        before_preamble, before_sections = sections(before)
+        after_preamble, after_sections = sections(after)
+        requirements = skill_row.get("requirements") or {}
+        claimed_keys = {
+            re.sub(r"[^a-z0-9]+", "_", str(row.get("section") or row.get("name") or "").lower()).strip("_")
+            for row in requirements.get("sections") or []
+            if isinstance(row, dict) and (row.get("section") or row.get("name"))
+        }
+        if skill_row.get("role") == "merge_target":
+            claimed_keys.update(before_sections)
+            claimed_keys.update(after_sections)
+        unclaimed_keys = (set(before_sections) | set(after_sections)) - claimed_keys
+        lines.extend(
+            [
+                "host-computed update boundary facts:",
+                json.dumps(
+                    {
+                        "frontmatter_and_preamble_unchanged": (
+                            before_preamble == after_preamble
+                            or skill_row.get("role") == "merge_target"
+                        ),
+                        "unclaimed_sections_unchanged": all(
+                            before_sections.get(key) == after_sections.get(key)
+                            for key in unclaimed_keys
+                        ),
+                        "claimed_sections_changed": {
+                            key: before_sections.get(key) != after_sections.get(key)
+                            for key in sorted(claimed_keys)
+                        },
+                    },
+                    indent=2,
+                ),
+            ]
+        )
+        for key in sorted(claimed_keys):
+            lines.extend(
+                [
+                    f"candidate claimed section {key}:",
+                    after_sections.get(key, "[missing]"),
+                ]
+            )
+    elif candidate.is_dir():
+        lines.extend(["candidate/SKILL.md:", after])
+    elif raw.is_dir():
+        lines.extend(["raw/SKILL.md (candidate removed):", before])
+
+    if candidate.is_dir():
+        files = sorted(
+            path.relative_to(candidate).as_posix()
+            for path in candidate.rglob("*")
+            if path.is_file()
+            and path.name != "SKILL.md"
+            and "__pycache__" not in path.relative_to(candidate).parts
+            and path.suffix != ".pyc"
+            and path.name != ".DS_Store"
+        )
+        lines.append("candidate resource files: " + json.dumps(files))
+        requirements = skill_row.get("requirements") or {}
+        required_directories = {
+            str(row.get("dir") or row.get("directory") or "")
+            for row in requirements.get("directories") or []
+            if isinstance(row, dict)
+        }
+        for relative in files:
+            path = candidate / relative
+            if relative.split("/", 1)[0] not in required_directories:
+                continue
+            if path.suffix.lower() not in {
+                ".json", ".md", ".py", ".sh", ".txt", ".yaml", ".yml"
+            }:
+                continue
+            content = read_text(path)
+            lines.extend([f"candidate/{relative}:", content])
+    inventory_summaries = []
+    inventory_root = workspace / "target/to_be_improved_skills"
+    if inventory_root.is_dir() and skill_row.get("role") != "merge_target":
+        for other in sorted(inventory_root.iterdir()):
+            if not other.is_dir() or other.name == skill:
+                continue
+            text = read_text(other / "SKILL.md")
+            if not text:
+                continue
+            description = re.search(r"^description:\s*(.+)$", text, re.MULTILINE)
+            inventory_summaries.append(
+                {
+                    "skill": other.name,
+                    "description": description.group(1).strip() if description else "",
+                }
+            )
+    if inventory_summaries:
+        lines.extend(
+            [
+                "other inventory skills (duplicate/subsumption check):",
+                json.dumps(inventory_summaries, ensure_ascii=False, indent=2),
+            ]
+        )
+    bundle = "\n".join(lines)
+    if len(bundle) > max_chars:
+        bundle = bundle[:max_chars] + "\n[host evidence truncated at 26000 characters]"
+    return bundle
+
+
+def parse_verifier_response_log(path: Path) -> dict[str, object]:
+    """Extract the last verifier-shaped JSON object from a CLI event stream."""
+    strings: list[str] = []
+
+    def collect(value: object) -> None:
+        if isinstance(value, str):
+            strings.append(value)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+        elif isinstance(value, dict):
+            for item in value.values():
+                collect(item)
+
+    raw_log = path.read_text(errors="replace")
+    # Some backends (notably DSH) print the final object as pretty JSON across
+    # many physical lines rather than wrapping it in one JSONL event. Preserve
+    # the complete stream as a candidate so raw_decode can recover that object.
+    # Per-line/event extraction remains useful for Codex and Claude streams.
+    strings.append(raw_log)
+    for line in raw_log.splitlines():
+        try:
+            collect(json.loads(line))
+        except json.JSONDecodeError:
+            strings.append(line)
+    candidates: list[dict[str, object]] = []
+    decoder = json.JSONDecoder()
+    for text in strings:
+        stripped = text.strip()
+        if stripped.startswith("```") and stripped.endswith("```"):
+            stripped = re.sub(r"^```(?:json)?\s*", "", stripped)
+            stripped = re.sub(r"\s*```$", "", stripped)
+        positions = [index for index, char in enumerate(stripped) if char == "{"]
+        for position in positions:
+            try:
+                value, _ = decoder.raw_decode(stripped[position:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict) and (
+                (
+                    isinstance(value.get("verification_steps"), list)
+                    and isinstance(value.get("feedback"), dict)
+                )
+                or (
+                    isinstance(value.get("skill"), str)
+                    and isinstance(value.get("failures"), list)
+                    and isinstance(value.get("penalties"), list)
+                )
+            ):
+                candidates.append(value)
+                break
+    if not candidates:
+        raise pipeline_contracts.ContractError(
+            "verifier response contains no full verification or compact verdict object"
+        )
+    return candidates[-1]
+
+
+def expand_compact_verifier_response(
+    response: dict[str, object],
+    required_output: dict[str, object],
+    verification_input: dict[str, object],
+    skill: str,
+) -> dict[str, object]:
+    """Expand a small model verdict into the runner-owned verification shape."""
+    if response.get("skill") != skill:
+        raise pipeline_contracts.ContractError(
+            f"compact verdict skill must equal {skill}"
+        )
+    failures = response.get("failures")
+    penalties = response.get("penalties")
+    if not isinstance(failures, list) or not isinstance(penalties, list):
+        raise pipeline_contracts.ContractError(
+            "compact verdict failures and penalties must be lists"
+        )
+    failure_map: dict[str, dict[str, object]] = {}
+    for index, failure in enumerate(failures):
+        if not isinstance(failure, dict):
+            raise pipeline_contracts.ContractError(
+                f"compact verdict failure {index} must be an object"
+            )
+        assertion_id = failure.get("assertion_id")
+        evidence = failure.get("evidence")
+        reasoning = failure.get("reasoning")
+        if not isinstance(assertion_id, str) or not assertion_id:
+            raise pipeline_contracts.ContractError(
+                f"compact verdict failure {index} has no assertion_id"
+            )
+        if assertion_id in failure_map:
+            raise pipeline_contracts.ContractError(
+                f"compact verdict duplicates assertion {assertion_id}"
+            )
+        if not isinstance(reasoning, str) or not reasoning.strip():
+            raise pipeline_contracts.ContractError(
+                f"compact verdict failure {assertion_id} has no reasoning"
+            )
+        if not isinstance(evidence, list) or not evidence or not all(
+            isinstance(item, str) and item.strip() for item in evidence
+        ):
+            raise pipeline_contracts.ContractError(
+                f"compact verdict failure {assertion_id} has no evidence"
+            )
+        failure_map[assertion_id] = failure
+    if failure_map and not penalties:
+        raise pipeline_contracts.ContractError(
+            "compact verdict failures require at least one priced penalty"
+        )
+
+    candidate = copy.deepcopy(required_output)
+    seen_assertions: set[str] = set()
+    pass_threshold = float(verification_input["scoring"]["pass_threshold"])
+    round_digits = int(verification_input["scoring"].get("round_digits", 4))
+    for group in candidate.get("verification_steps") or []:
+        if not isinstance(group, dict):
+            continue
+        failed_steps: list[str] = []
+        for step in group.get("steps") or []:
+            if not isinstance(step, dict) or not step.get("applicable"):
+                continue
+            scores: list[float] = []
+            evidence: list[str] = []
+            for assertion in step.get("assertion_results") or []:
+                if not isinstance(assertion, dict):
+                    continue
+                assertion_id = str(assertion.get("assertion_id") or "")
+                seen_assertions.add(assertion_id)
+                failure = failure_map.get(assertion_id)
+                if failure is None:
+                    assertion.update(
+                        {
+                            "status": "pass",
+                            "score": 1.0,
+                            "reasoning": "No contradiction was found by the verifier.",
+                            "evidence": ["Inspected the operation-scoped evidence."],
+                        }
+                    )
+                else:
+                    assertion.update(
+                        {
+                            "status": "fail",
+                            "score": 0.0,
+                            "reasoning": failure["reasoning"],
+                            "evidence": failure["evidence"],
+                        }
+                    )
+                scores.append(float(assertion["score"]))
+                evidence.extend(str(item) for item in assertion["evidence"])
+            score = round(sum(scores) / len(scores), round_digits)
+            status = "pass" if score >= pass_threshold else "fail"
+            step.update(
+                {
+                    "status": status,
+                    "score": score,
+                    "reasoning": (
+                        "All assertions passed."
+                        if status == "pass"
+                        else "One or more required assertions failed."
+                    ),
+                    "evidence": list(dict.fromkeys(evidence)),
+                }
+            )
+            if status == "fail":
+                failed_steps.append(str(step.get("id")))
+        row = next(
+            (
+                item
+                for item in candidate["feedback"]["per_skill"]
+                if isinstance(item, dict) and item.get("skill") == skill
+            ),
+            None,
+        )
+        if isinstance(row, dict):
+            row["failed_required_steps"] = sorted(failed_steps)
+    unknown = sorted(set(failure_map) - seen_assertions)
+    if unknown:
+        raise pipeline_contracts.ContractError(
+            f"compact verdict names unknown assertion IDs: {', '.join(unknown)}"
+        )
+    feedback_text = response.get("feedback")
+    if not isinstance(feedback_text, str) or not feedback_text.strip():
+        raise pipeline_contracts.ContractError(
+            "compact verdict feedback must be a non-empty string"
+        )
+    row = candidate["feedback"]["per_skill"][0]
+    row["penalties"] = copy.deepcopy(penalties)
+    row["feedback"] = feedback_text
+    candidate["feedback"]["overall_feedback"] = f"{skill}: {feedback_text}"
+    replay = response.get("replay")
+    if not isinstance(replay, dict):
+        raise pipeline_contracts.ContractError(
+            "compact verdict replay must be an object"
+        )
+    candidate["feedback"]["replay"] = copy.deepcopy(replay)
+    ood = response.get("ood", [])
+    if not isinstance(ood, list):
+        raise pipeline_contracts.ContractError("compact verdict ood must be a list")
+    candidate["feedback"]["ood"] = copy.deepcopy(ood)
+    return candidate
+
+
+def validate_skill_verifier_response(
+    operation_directory: Path,
+    skill: str,
+    verification_input: dict[str, object],
+    required_output: dict[str, object],
+    response: dict[str, object],
+) -> dict[str, object]:
+    """Validate an agent response in an isolated one-skill contract directory."""
+    root = operation_directory / "verifier-responses" / safe_name(skill)
+    root.mkdir(parents=True, exist_ok=True)
+    input_path = root / "verification-input.json"
+    output_path = root / "verification.json"
+    atomic_write_json(input_path, verification_input)
+    candidate = (
+        expand_compact_verifier_response(
+            response, required_output, verification_input, skill
+        )
+        if "verification_steps" not in response
+        else copy.deepcopy(response)
+    )
+    for key in ("diagnosis", "nod", "result", "verification_input", "changelog"):
+        candidate[key] = copy.deepcopy(required_output.get(key))
+    candidate_feedback = candidate.get("feedback")
+    if not isinstance(candidate_feedback, dict):
+        raise pipeline_contracts.ContractError("$.feedback: must be an object")
+    candidate_feedback["action"] = None
+    for row in candidate_feedback.get("per_skill") or []:
+        if isinstance(row, dict):
+            row["action"] = None
+            row["retries_used"] = 0
+    pipeline_contracts.apply_decision_scores(candidate, verification_input)
+    atomic_write_json(output_path, candidate)
+    return pipeline_contracts.validate_verification(
+        output_path,
+        judged=False,
+        expected_skills={skill},
+    )
+
+
+def aggregate_skill_verifications(
+    output_skeleton: dict[str, object],
+    responses: list[dict[str, object]],
+) -> dict[str, object]:
+    """Combine validated per-skill responses into the operation output."""
+    result = copy.deepcopy(output_skeleton)
+    groups = [
+        group
+        for response in responses
+        for group in response["verification_steps"]
+    ]
+    for skill_index, group in enumerate(groups):
+        group["steps_from"] = (
+            f"verification-input.json#/skills/{skill_index}/checks"
+        )
+        for check_index, step in enumerate(group.get("steps") or []):
+            if isinstance(step, dict):
+                step["input_ref"] = (
+                    f"#/skills/{skill_index}/checks/{check_index}"
+                )
+    result["verification_steps"] = groups
+    rows = [
+        row
+        for response in responses
+        for row in response["feedback"]["per_skill"]
+    ]
+    scores = {row["skill"]: float(row["score"]) for row in rows}
+    overall_score = min(scores.values())
+    bottlenecks = sorted(
+        skill for skill, score in scores.items()
+        if abs(score - overall_score) <= 1e-6
+    )
+    replays = [response["feedback"]["replay"] for response in responses]
+    replay = next(
+        (
+            item for item in replays
+            if item.get("available") and item.get("status") == "fail"
+        ),
+        next((item for item in replays if item.get("available")), replays[0]),
+    )
+    feedback = result["feedback"]
+    feedback["per_skill"] = rows
+    feedback["overall_score"] = overall_score
+    feedback["bottleneck_skills"] = bottlenecks
+    feedback["replay"] = copy.deepcopy(replay)
+    feedback["overall_status"] = (
+        "pass" if all(row["status"] == "pass" for row in rows) else "fail"
+    )
+    feedback["overall_feedback"] = " | ".join(
+        f"{row['skill']}: {row['feedback']}" for row in rows
+    )
+    feedback["retry_budget"] = 0
+    feedback["action"] = None
+    feedback["ood"] = [
+        item
+        for response in responses
+        for item in response["feedback"]["ood"]
+    ]
+    return result
+
+
+def deterministic_removed_skill_verdict(
+    workspace: Path,
+    skill_row: dict[str, object],
+) -> dict[str, object] | None:
+    """Resolve mechanically removed operation roles without an LLM call.
+
+    Merge, split, and delete sources have no candidate content to assess. When
+    the immutable baseline exists and the candidate is absent, their complete
+    verification claim is the filesystem transition itself. Any mismatch is
+    deliberately left to the normal verifier so failures still receive
+    evidence-rich feedback.
+    """
+    role = str(skill_row.get("role") or "")
+    if role not in {"deleted", "merge_source", "split_source"}:
+        return None
+    if skill_row.get("baseline_expected") is not True:
+        return None
+    if skill_row.get("candidate_expected") is not False:
+        return None
+    skill = str(skill_row.get("skill") or "")
+    if not skill:
+        return None
+    baseline = workspace / "target/raw_skills" / skill
+    candidate = workspace / "target/to_be_improved_skills" / skill
+    if not baseline.is_dir() or candidate.exists():
+        return None
+    return {
+        "skill": skill,
+        "failures": [],
+        "penalties": [],
+        "feedback": (
+            f"Deterministic removal check passed for {role}: the immutable "
+            f"baseline for {skill} exists and the candidate path is absent."
+        ),
+        "replay": {
+            "available": False,
+            "kind": "targeted_detector",
+            "status": "not_run",
+            "reason": "No post-edit replay was provided.",
+            "before": None,
+            "after": None,
+        },
+        "ood": [],
+    }
+
+
+def run_per_skill_verification(
+    workspace: Path,
+    *,
+    auth: dict[str, str],
+    model: str | None,
+    install_agent: bool,
+    suffix: str,
+    metadata: dict[str, object],
+) -> Path:
+    """Prompt, parse, validate, and aggregate one verifier response per skill."""
+    operation_directory = workspace / "run"
+    skeleton_path = operation_directory / "verification-output.required.json"
+    input_path = operation_directory / "verification-input.json"
+    input_bytes = input_path.read_bytes()
+    verification_input = json.loads(input_bytes)
+    output_skeleton = verification_builder.build(
+        json.loads((operation_directory / "evolve-goal.json").read_text()),
+        json.loads(verification_builder.TEMPLATE.read_text()),
+        json.loads((operation_directory / "changelog.json").read_text()),
+        hashlib.sha256(input_bytes).hexdigest(),
+        verification_input,
+    )
+    atomic_write_json(skeleton_path, output_skeleton)
+
+    def verify_skill(skill_row: dict[str, object]) -> dict[str, object]:
+        skill = str(skill_row["skill"])
+        skill_input, required_output = verifier_skill_payloads(
+            verification_input,
+            output_skeleton,
+            skill,
+        )
+        evidence_bundle = verifier_evidence_bundle(workspace, skill_row)
+        deterministic = deterministic_removed_skill_verdict(
+            workspace, skill_row
+        )
+        if deterministic is not None:
+            with pipeline_metrics.span(
+                workspace,
+                "verifiter",
+                f"{suffix}-{safe_name(skill)}-deterministic-removal",
+                "deterministic",
+                metadata={
+                    **metadata,
+                    "skill": skill,
+                    "response_protocol": "deterministic-removal-v1",
+                },
+            ):
+                return validate_skill_verifier_response(
+                    operation_directory,
+                    skill,
+                    skill_input,
+                    required_output,
+                    deterministic,
+                )
+        previous_error: str | None = None
+        for response_attempt in range(VERIFIER_RESPONSE_RETRY_BUDGET + 1):
+            prompt = verifier_response_prompt(
+                skill,
+                skill_input,
+                required_output,
+                evidence_bundle=evidence_bundle,
+                previous_error=previous_error,
+            )
+            response_suffix = (
+                f"{suffix}-{safe_name(skill)}-response-{response_attempt + 1}"
+            )
+            log_path = run_session(
+                "verifiter",
+                workspace,
+                prompt,
+                auth,
+                model,
+                install_agent,
+                response_suffix,
+                {
+                    **metadata,
+                    "skill": skill,
+                    "response_attempt": response_attempt + 1,
+                    "response_retry_kind": "json_or_contract_only",
+                    "response_protocol": "compact-exceptions-v1",
+                },
+                json_output=True,
+            )
+            try:
+                response = parse_verifier_response_log(log_path)
+                return validate_skill_verifier_response(
+                    operation_directory,
+                    skill,
+                    skill_input,
+                    required_output,
+                    response,
+                )
+            except (
+                json.JSONDecodeError,
+                pipeline_contracts.ContractError,
+            ) as error:
+                previous_error = str(error)
+                if response_attempt >= VERIFIER_RESPONSE_RETRY_BUDGET:
+                    raise
+        raise pipeline_contracts.ContractError(
+            f"verifier produced no response for {skill}"
+        )
+
+    responses = [
+        row
+        for row in run_pool(
+            list(verification_input["skills"]),
+            DEFAULT_OP_WORKERS,
+            verify_skill,
+        )
+        if isinstance(row, dict)
+    ]
+    final = aggregate_skill_verifications(output_skeleton, responses)
+    verification_path = operation_directory / "verification.json"
+    atomic_write_json(verification_path, final)
+    pipeline_contracts.validate_verification(
+        verification_path,
+        judged=False,
+        expected_skills={
+            str(row["skill"]) for row in verification_input["skills"]
+        },
+    )
+    return verification_path
+
+
+def write_judge_record(
+    operation_directory: Path,
+    *,
+    status: str | None = None,
+    reason: str | None = None,
+) -> Path:
+    verification_path = operation_directory / "verification.json"
+    changelog_path = operation_directory / "changelog.json"
+    verification = json.loads(verification_path.read_text())
+    status = status or str(verification.get("status") or "completed")
+    if reason is None and status in {"skipped", "failed"}:
+        reason = str(verification.get("reason") or status)
+    changes = json.loads(changelog_path.read_text()).get("changes") or []
+    if not changes:
+        raise SystemExit("operation changelog has no changes")
+    first_change = changes[0]
+    judge: dict[str, object] = {
+        "schema_version": 1,
+        "date": first_change.get("date"),
+        "run_id": first_change.get("run_id"),
+        "finding_id": first_change.get("finding_id"),
+        "op_index": first_change.get("op_index"),
+        "skills": sorted(
+            {
+                str(change["skill"])
+                for change in changes
+                if isinstance(change, dict) and change.get("skill")
+            }
+        ),
+        "status": status,
+        "action": copy.deepcopy(
+            (verification.get("feedback") or {}).get("action")
+        ),
+        "artifacts": {
+            name: _artifact_reference(operation_directory / filename)
+            for name, filename in {
+                "goal": "evolve-goal.json",
+                "verification_input": "verification-input.json",
+                "verification": "verification.json",
+                "changelog": "changelog.json",
+            }.items()
+        },
+    }
+    if reason:
+        judge["reason"] = reason
+    path = operation_directory / "judge.json"
+    atomic_write_json(path, judge)
+    return path
+
+
+def finalize_no_change_scope(
+    workspace: Path,
+    run_id: str,
+    finding_id: str,
+    goal_path: Path,
+) -> Path:
+    """Publish and validate the terminal bundle for a no-change scope."""
+    goal = pipeline_contracts.validate_goal(goal_path)
+    action = goal["action"]
+    if action.get("disposition") != "no_change" or action.get("ops"):
+        raise SystemExit(f"scope is not no_change: {goal_path}")
+    reason = str(action["reason"])
+    directory = goal_path.parent
+    now = datetime.now(UTC)
+    date_value = now.date().isoformat()
+    markers = [
+        _phase_marker("goal", "completed"),
+        *[
+            _phase_marker(phase, "skipped", reason)
+            for phase in OPERATION_PHASES[1:]
+        ],
+    ]
+    changelog = {
+        "schema_version": 1,
+        "date": date_value,
+        "run_id": run_id,
+        "finding_id": finding_id,
+        "disposition": "no_change",
+        "reason": reason,
+        "changes": [],
+        "phase_markers": markers,
+        "phase_events": copy.deepcopy(markers),
+    }
+    changelog_path = directory / "changelog.json"
+    atomic_write_json(changelog_path, changelog)
+    verification_input = {
+        "schema_version": 1,
+        "date": date_value,
+        "run_id": run_id,
+        "finding_id": finding_id,
+        "op_index": 0,
+        "operation": "no_change",
+        "status": "skipped",
+        "reason": reason,
+        "skills": [],
+    }
+    input_path = directory / "verification-input.json"
+    atomic_write_json(input_path, verification_input)
+    verification = {
+        "schema_version": 1,
+        "date": date_value,
+        "run_id": run_id,
+        "finding_id": finding_id,
+        "op_index": 0,
+        "operation": "no_change",
+        "status": "skipped",
+        "phase": "verification",
+        "reason": reason,
+        "skills": [],
+        "verification_input": _artifact_reference(input_path),
+        "changelog": [],
+    }
+    verification_path = directory / "verification.json"
+    atomic_write_json(verification_path, verification)
+    judge = {
+        "schema_version": 1,
+        "date": date_value,
+        "run_id": run_id,
+        "finding_id": finding_id,
+        "op_index": 0,
+        "skills": [],
+        "status": "skipped",
+        "action": None,
+        "reason": reason,
+        "artifacts": {
+            name: _artifact_reference(directory / filename)
+            for name, filename in {
+                "goal": "evolve-goal.json",
+                "verification_input": "verification-input.json",
+                "verification": "verification.json",
+                "changelog": "changelog.json",
+            }.items()
+        },
+    }
+    atomic_write_json(directory / "judge.json", judge)
+    pipeline_contracts.validate_no_change_artifacts(directory)
+    return directory
+
+
+def finalize_unexecuted_operation(
+    workspace: Path,
+    finding_id: str,
+    op_index: int,
+    *,
+    status: str,
+    reason: str,
+) -> Path:
+    """Write a complete, linked bundle when later phases cannot execute."""
+    operation_directory = (
+        workspace / "run" / finding_id / "ops" / str(op_index)
+    )
+    changelog = json.loads(
+        (operation_directory / "changelog.json").read_text()
+    )
+    input_path = operation_directory / "verification-input.json"
+    if not input_path.is_file():
+        goal = json.loads(
+            (operation_directory / "evolve-goal.json").read_text()
+        )
+        operation = goal["action"]["ops"][0]
+        materialize_verification_input(
+            workspace,
+            goal,
+            operation,
+            str((changelog.get("changes") or [{}])[0].get("run_id") or ""),
+            finding_id,
+            op_index,
+            out=input_path,
+        )
+    require_path(input_path, "operation verification input")
+    verification = {
+        "schema_version": 1,
+        "phase": "verification",
+        "status": status,
+        "date": datetime.now(UTC).date().isoformat(),
+        "reason": reason,
+        "skills": sorted(
+            {
+                str(change["skill"])
+                for change in changelog.get("changes") or []
+                if isinstance(change, dict) and change.get("skill")
+            }
+        ),
+        "verification_input": {
+            "path": "verification-input.json",
+            "sha256": hashlib.sha256(input_path.read_bytes()).hexdigest(),
+        },
+        "changelog": copy.deepcopy(changelog.get("changes") or []),
+    }
+    atomic_write_json(operation_directory / "verification.json", verification)
+    write_judge_record(
+        operation_directory, status=status, reason=reason
+    )
+    pipeline_contracts.validate_operation_artifacts(operation_directory)
+    return operation_directory
+
+
+def accept_operation_bundle(
+    workspace: Path,
+    finding_id: str,
+    op_index: int,
+) -> None:
+    operation_directory = (
+        workspace / "run" / finding_id / "ops" / str(op_index)
+    )
+    changelog_path = operation_directory / "changelog.json"
+    verification_path = operation_directory / "verification.json"
+    changelog = json.loads(changelog_path.read_text())
+    verification = json.loads(verification_path.read_text())
+    accepted_ids: set[str] = set()
+    for change in changelog.get("changes") or []:
+        if isinstance(change, dict):
+            change["status"] = "accepted"
+            accepted_ids.add(str(change.get("id")))
+    for change in verification.get("changelog") or []:
+        if isinstance(change, dict) and str(change.get("id")) in accepted_ids:
+            change["status"] = "accepted"
+    atomic_write_json(changelog_path, changelog)
+    atomic_write_json(verification_path, verification)
+    write_judge_record(operation_directory)
+    pipeline_contracts.validate_operation_artifacts(operation_directory)
+
+
+def transition_worker_lifecycle(
+    worker: Path,
+    cluster: str,
+    op_index: int,
+    affected: set[str],
+) -> None:
+    metadata_path = (
+        worker / "target/to_be_improved_skills_metadata/metadata.json"
+    )
+    if not metadata_path.is_file():
+        return
+    verification_path = (
+        worker
+        / "run"
+        / cluster
+        / "ops"
+        / str(op_index)
+        / "verification.json"
+    )
+    verification = (
+        json.loads(verification_path.read_text())
+        if verification_path.is_file()
+        else {}
+    )
+    replay = ((verification.get("feedback") or {}).get("replay") or {})
+    behavioral = replay_meets_promotion_gate(replay)
+    document = json.loads(metadata_path.read_text())
+    changed = False
+    now = datetime.now(UTC).isoformat()
+    skill_root = worker / "target/to_be_improved_skills"
+    policy = preprocessing_config().get("evolution_policy") or {}
+    minimum_sessions = int(policy.get("create_min_distinct_sessions", 2))
+    for row in document.get("skills_metadata") or []:
+        if not isinstance(row, dict) or row.get("skill") not in affected:
+            continue
+        entry = verification_changelog_entry(
+            worker, cluster, op_index, str(row.get("skill"))
+        )
+        line = _phase_line(entry) if entry is not None else ""
+        if line:
+            append_changelog_lines(
+                worker / SKILL_CHANGELOG_DIR, str(row.get("skill")), [line]
+            )
+        lifecycle = row.get("lifecycle")
+        if not isinstance(lifecycle, dict):
+            continue
+        enough_sessions = (
+            int(lifecycle.get("distinct_sessions") or 0)
+            >= minimum_sessions
+        )
+        lifecycle["status"] = (
+            "promoted"
+            if enough_sessions and behavioral
+            else "evaluated"
+        )
+        lifecycle["evaluated_at"] = now
+        lifecycle["evaluation_kind"] = (
+            "behavioral_replay" if behavioral else "structural"
+        )
+        if lifecycle["status"] == "promoted":
+            lifecycle["promoted_at"] = now
+        else:
+            lifecycle.pop("promoted_at", None)
+        directory = skill_root / str(row["skill"])
+        if directory.is_dir():
+            lifecycle["content_sha256"] = skill_content_sha256(directory)
+        changed = True
+    if changed:
+        atomic_write_json(metadata_path, document)
+
+
+def merge_worker_statuses(worker: Path, workspace: Path, suffix: str) -> None:
+    safe = safe_name(suffix)
+    for stage in ("optimize", "verifiter", "judge"):
+        source = worker / "run/status" / stage / f"{safe}.json"
+        if source.is_file():
+            replace_path(source, workspace / "run/status" / stage / source.name)
+
+
+def write_operation_resource_metrics(
+    workspace: Path,
+    cluster: str,
+    op_index: int,
+    operation: dict[str, object],
+    skills: set[str],
+    suffixes: list[str],
+) -> dict[str, object]:
+    """Persist observed and proxy resource metrics for one accepted operation."""
+    use_evidence_paths = [
+        workspace / "run" / cluster / "ops" / str(op_index) / name
+        for name in ("verification.json", "judge.json", "changelog.json")
+    ]
+    execution_evidence_paths: list[Path] = []
+    for suffix in suffixes:
+        execution_evidence_paths.append(
+            session_log_path(workspace, "optimize", suffix)
+        )
+        use_evidence_paths.extend(
+            session_log_path(workspace, stage, suffix)
+            for stage in ("verifiter", "judge")
+        )
+    evidence = "\n".join(
+        path.read_text(errors="replace")
+        for path in execution_evidence_paths + use_evidence_paths
+        if path.is_file()
+    )
+    use_evidence = "\n".join(
+        path.read_text(errors="replace")
+        for path in use_evidence_paths
+        if path.is_file()
+    )
+    skill_root = workspace / "target/to_be_improved_skills"
+    plans: dict[str, list[dict[str, object]]] = {}
+    kind = operation.get("op")
+    if kind in {"create", "update"}:
+        records = operation.get("skills") or []
+    elif kind == "merge":
+        records = [operation.get("into")]
+    elif kind == "split":
+        records = operation.get("into") or []
+    else:
+        records = []
+    for record in records:
+        if isinstance(record, dict) and isinstance(record.get("skill"), str):
+            plans[str(record["skill"])] = list(record.get("resource_plan") or [])
+    rows = [
+        skill_resources.measure_skill_resources(
+            skill_root / name,
+            evidence,
+            use_evidence,
+            plans.get(name, []),
+            runtime_observation_available=False,
+        )
+        for name in sorted(skills)
+        if (skill_root / name / "SKILL.md").is_file()
+    ]
+    document: dict[str, object] = {
+        "schema_version": 1,
+        "cluster": cluster,
+        "op_index": op_index,
+        "skills": rows,
+    }
+    preservation_path = (
+        workspace
+        / "run"
+        / cluster
+        / "ops"
+        / str(op_index)
+        / "resource-preservation.json"
+    )
+    if preservation_path.is_file():
+        document["preservation"] = json.loads(preservation_path.read_text())
+    document["aggregate"] = skill_resources.aggregate_resource_metrics([document])
+    path = (
+        workspace
+        / "run"
+        / cluster
+        / "ops"
+        / str(op_index)
+        / "resource-metrics.json"
+    )
+    atomic_write_json(path, document)
+    return document
+
+
+def publish_operation_result(
+    workspace: Path, result: dict[str, object]
+) -> None:
+    cluster = str(result["cluster"])
+    op_index = int(result["op_index"])
+    final_judge_action = str(result.get("judge_action", "pass"))
+    if final_judge_action != "pass":
+        _archive_operation_records(workspace, result)
+        write_publication(
+            workspace,
+            cluster,
+            op_index,
+            accepted=False,
+            reason=f"judge-{final_judge_action}",
+        )
+        for source in result.get("bundled_sources") or []:
+            if not isinstance(source, dict):
+                continue
+            write_publication(
+                workspace,
+                str(source.get("cluster")),
+                int(source.get("op_index")),
+                accepted=False,
+                reason=f"judge-{final_judge_action}",
+            )
+        return
+    if infrastructure_evolution_blocked(workspace, cluster):
+        drop_created_skills(
+            workspace, created_skill_names(result["op"])
+        )
+        _archive_operation_records(workspace, result)
+        write_publication(
+            workspace,
+            cluster,
+            op_index,
+            accepted=False,
+            reason=INFRASTRUCTURE_REFUSAL,
+        )
+        return
+    affected = {str(name) for name in result.get("affected") or []}
+    skill_root = result["worker"] / "target/to_be_improved_skills"
+    for name in sorted(affected):
+        skill = skill_root / name
+        if skill.is_dir() and (skill / "SKILL.md").is_file():
+            skill_resources.generate_openai_yaml(skill)
+    release = release_bundle.prepare_release(
+        workspace,
+        result["worker"],
+        cluster,
+        op_index,
+        result["op"],
+        affected,
+    )
+    release_id = str(release["release_id"])
+    try:
+        merge_operation_result(workspace, result)
+    except BaseException:
+        release_bundle.rollback_release(workspace, release_id)
+        raise
+    release_pointer = release_bundle.commit_release(workspace, release_id)
+    for name in sorted(affected):
+        remove_transient_skill_artifacts(
+            workspace / "target/to_be_improved_skills" / name
+        )
+    resource_metrics = write_operation_resource_metrics(
+        workspace,
+        cluster,
+        op_index,
+        result["op"],
+        affected,
+        [str(suffix) for suffix in result.get("suffixes") or []],
+    )
+    for row in resource_metrics["skills"]:
+        pipeline_metrics.record_instant(
+            metrics_workspace(workspace),
+            "resource-usefulness",
+            f"{cluster}-op-{op_index}-{row['skill']}",
+            {"cluster": cluster, "op_index": op_index, **row},
+        )
+    retirement_archives = update_candidate_pool(
+        workspace, affected
+    )
+    if retirement_archives:
+        atomic_write_json(
+            workspace
+            / "run"
+            / cluster
+            / "ops"
+            / str(op_index)
+            / "retirement-archives.json",
+            {
+                "schema_version": 1,
+                "operation": result["op"].get("op"),
+                "archives": retirement_archives,
+            },
+        )
+    write_publication(
+        workspace,
+        cluster,
+        op_index,
+        accepted=True,
+        reason=None,
+        release_id=release_id,
+        release_channel=str(release_pointer["channel"]),
+    )
+    for source in result.get("bundled_sources") or []:
+        if not isinstance(source, dict):
+            continue
+        source_cluster = str(source.get("cluster"))
+        source_index = int(source.get("op_index"))
+        if source_cluster == cluster and source_index == op_index:
+            continue
+        accept_operation_bundle(
+            workspace, source_cluster, source_index
+        )
+        write_publication(
+            workspace,
+            source_cluster,
+            source_index,
+            accepted=True,
+            reason="bundled",
+            outcome="bundled",
+            selected_cluster=cluster,
+            selected_op_index=op_index,
+            release_id=release_id,
+            release_channel=str(release_pointer["channel"]),
+        )
+
+
+def _archive_operation_records(
+    workspace: Path, result: dict[str, object]
+) -> None:
+    worker = result["worker"]
+    cluster = str(result["cluster"])
+    op_index = int(result["op_index"])
+    operation_directory = (
+        worker / "run" / cluster / "ops" / str(op_index)
+    )
+    pipeline_contracts.validate_operation_artifacts(operation_directory)
+    for relative in (
+        Path("run") / cluster / "ops" / str(op_index) / "verification.json",
+        Path("run") / cluster / "ops" / str(op_index) / "verification-input.json",
+        Path("run") / cluster / "ops" / str(op_index) / "evolve-goal.json",
+        Path("run") / cluster / "ops" / str(op_index) / "judge.json",
+        Path("run") / cluster / "ops" / str(op_index) / "changelog.json",
+    ):
+        source = worker / relative
+        replace_path(source, workspace / relative)
+    replay_source = worker / "run/replay"
+    if replay_source.is_dir():
+        replay_target = (
+            workspace / "run" / cluster / "ops" / str(op_index) / "replay"
+        )
+        replace_path(replay_source, replay_target)
+    for suffix in result["suffixes"]:
+        merge_worker_statuses(worker, workspace, str(suffix))
+    merge_worker_log(worker, workspace)
+
+
+def merge_operation_result(
+    workspace: Path, result: dict[str, object]
+) -> None:
+    with pipeline_metrics.span(
+        metrics_workspace(workspace),
+        "merge-operation",
+        f"{result['cluster']}-op-{result['op_index']}",
+        "orchestration",
+    ):
+        _merge_operation_result(workspace, result)
+
+
+def _merge_operation_result(
+    workspace: Path, result: dict[str, object]
+) -> None:
+    worker = result["worker"]
+    cluster = str(result["cluster"])
+    op_index = int(result["op_index"])
+    accept_operation_bundle(worker, cluster, op_index)
+    pipeline_contracts.validate_operation_artifacts(
+        worker / "run" / cluster / "ops" / str(op_index)
+    )
+    affected = set(result["affected"])
+    transition_worker_lifecycle(worker, cluster, op_index, affected)
+    improved_rel = Path("target/to_be_improved_skills")
+    raw_rel = Path("target/raw_skills")
+    for skill in sorted(affected):
+        source = worker / improved_rel / skill
+        target = workspace / improved_rel / skill
+        if source.is_dir():
+            replace_path(source, target)
+        elif target.exists():
+            shutil.rmtree(target)
+        raw_source = worker / raw_rel / skill
+        if raw_source.is_dir():
+            replace_path(raw_source, workspace / raw_rel / skill)
+    metadata = merge_metadata(workspace, worker, affected)
+    for skill in sorted(affected):
+        merge_changelog_file(
+            worker / SKILL_CHANGELOG_DIR / f"{skill}.md",
+            workspace / SKILL_CHANGELOG_DIR / f"{skill}.md",
+        )
+    current = skill_inventory_names(workspace / improved_rel)
+    pipeline_contracts.validate_metadata(metadata, current)
+    archived_rel = Path("run") / cluster / "ops" / str(op_index) / "verification.json"
+    replace_path(worker / archived_rel, workspace / archived_rel)
+    input_rel = (
+        Path("run")
+        / cluster
+        / "ops"
+        / str(op_index)
+        / "verification-input.json"
+    )
+    replace_path(worker / input_rel, workspace / input_rel)
+    op_goal_rel = Path("run") / cluster / "ops" / str(op_index) / "evolve-goal.json"
+    replace_path(worker / op_goal_rel, workspace / op_goal_rel)
+    judge_rel = Path("run") / cluster / "ops" / str(op_index) / "judge.json"
+    replace_path(worker / judge_rel, workspace / judge_rel)
+    changelog_rel = (
+        Path("run") / cluster / "ops" / str(op_index) / "changelog.json"
+    )
+    replace_path(worker / changelog_rel, workspace / changelog_rel)
+    pipeline_contracts.validate_operation_artifacts(
+        workspace / "run" / cluster / "ops" / str(op_index)
+    )
+    replay_source = worker / "run/replay"
+    if replay_source.is_dir():
+        replay_target = (
+            workspace / "run" / cluster / "ops" / str(op_index) / "replay"
+        )
+        replace_path(replay_source, replay_target)
+    for suffix in result["suffixes"]:
+        merge_worker_statuses(worker, workspace, str(suffix))
+    merge_worker_log(worker, workspace)
+
+
+def _finding_audit(workspace: Path, cluster: str) -> dict[str, object]:
+    path = workspace / "traces/derived/findings" / cluster / "finding.json"
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        "detector": data.get("detector"),
+        "routing": data.get("routing"),
+        "severity": data.get("severity"),
+        "confidence": data.get("confidence"),
+        "score": data.get("score"),
+    }
+
+
+def _emit_edit_decisions(
+    workspace: Path,
+    max_ops_per_skill: int,
+    min_super_score: float,
+) -> None:
+    path = workspace / "run/goal-reduction.json"
+    if not path.is_file():
+        return
+    try:
+        document = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return
+    if not isinstance(document, dict):
+        return
+    document["max_ops_per_skill"] = document.get("max_ops_per_skill", max_ops_per_skill)
+    document["min_super_score"] = document.get("min_super_score", min_super_score)
+    document["retry_budget"] = document.get("retry_budget", RETRY_BUDGET)
+    document["max_attempts"] = document.get("max_attempts", RETRY_BUDGET + 1)
+    atomic_write_json(path, document)
+    policy = {
+        "max_ops_per_skill": document["max_ops_per_skill"],
+        "min_super_score": document["min_super_score"],
+        "retry_budget": document["retry_budget"],
+        "max_attempts": document["max_attempts"],
+    }
+    for row in document.get("decisions") or []:
+        if not isinstance(row, dict):
+            continue
+        pipeline_metrics.record_instant(
+            metrics_workspace(workspace),
+            "edit-decision",
+            f"{row.get('cluster')}-op-{row.get('op_index')}",
+            {**row, **policy},
+        )
+
+
+def _emit_goal_decision(workspace: Path, cluster: str, goal: Path) -> None:
+    try:
+        data = json.loads(goal.read_text())
+    except json.JSONDecodeError:
+        return
+    action = data.get("action") if isinstance(data, dict) else None
+    if not isinstance(action, dict):
+        return
+    ops = action.get("ops") if isinstance(action.get("ops"), list) else []
+    skills: list[str] = []
+    names: set[str] = set()
+    for op in ops:
+        if not isinstance(op, dict):
+            continue
+        for name in skill_names_mod.skill_names(op):
+            if name not in names:
+                names.add(name)
+                skills.append(name)
+    pipeline_metrics.record_instant(
+        metrics_workspace(workspace),
+        "goal-decision",
+        cluster,
+        {
+            "cluster": cluster,
+            "disposition": action.get("disposition", "change" if ops else "no_change"),
+            "reason": action.get("reason"),
+            "op_count": len(ops),
+            "ops": [op.get("op") for op in ops if isinstance(op, dict)],
+            "skills": skills,
+        },
+    )
+
+
+def _emit_judge_decision(
+    workspace: Path,
+    cluster: str,
+    op_index: int,
+    verification: Path,
+    attempt: int,
+) -> None:
+    try:
+        data = json.loads(verification.read_text())
+    except json.JSONDecodeError:
+        return
+    feedback = data.get("feedback") if isinstance(data, dict) else None
+    if not isinstance(feedback, dict):
+        return
+    action = feedback.get("action") if isinstance(feedback.get("action"), dict) else {}
+    per_skill = feedback.get("per_skill") if isinstance(feedback.get("per_skill"), list) else []
+    used = [
+        row.get("retries_used")
+        for row in per_skill
+        if isinstance(row, dict) and isinstance(row.get("retries_used"), int)
+    ]
+    failed = [
+        row.get("skill")
+        for row in per_skill
+        if isinstance(row, dict) and row.get("status") == "fail"
+    ]
+    judge_op = action.get("op")
+    pipeline_metrics.record_instant(
+        metrics_workspace(workspace),
+        "judge-decision",
+        f"{cluster}-op-{op_index}-try-{attempt}",
+        {
+            "cluster": cluster,
+            "op_index": op_index,
+            "attempt": attempt,
+            "judge_action": judge_op,
+            "judge_to": action.get("to"),
+            "retry_budget": feedback.get("retry_budget", RETRY_BUDGET),
+            "max_attempts": RETRY_BUDGET + 1,
+            "retries_used": max(used) if used else 0,
+            "will_retry": False,
+            "overall_status": feedback.get("overall_status"),
+            "failed_skills": failed,
+        },
+    )
+
+
+def _finding_confidence(workspace: Path, cluster: str) -> float:
+    path = workspace / "traces/derived/findings" / cluster / "finding.json"
+    if not path.is_file():
+        return 0.0
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return 0.0
+    try:
+        return float(data.get("confidence") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def candidate_directory(workspace: Path, cluster: str, op_index: int) -> Path:
+    return workspace / "run" / cluster / "ops" / str(op_index) / "candidate"
+
+
+def preserve_optimized_candidate(
+    workspace: Path,
+    private: Path,
+    cluster: str,
+    op_index: int,
+    op: dict,
+) -> None:
+    """Keep the optimized skill in the run so verification can be repeated."""
+    root = candidate_directory(workspace, cluster, op_index)
+    if root.exists():
+        shutil.rmtree(root)
+    names = skill_names_mod.skill_names(op)
+    improved = private / "target/to_be_improved_skills"
+    raw = private / "target/raw_skills"
+    for name in names:
+        source = improved / name
+        if source.is_dir():
+            shutil.copytree(source, root / "to_be_improved_skills" / name)
+        raw_source = raw / name
+        if raw_source.is_dir():
+            shutil.copytree(raw_source, root / "raw_skills" / name)
+    metadata_path = (
+        private / "target/to_be_improved_skills_metadata/metadata.json"
+    )
+    rows: list[object] = []
+    if metadata_path.is_file():
+        document = json.loads(metadata_path.read_text())
+        wanted = set(names)
+        rows = [
+            row
+            for row in document.get("skills_metadata") or []
+            if isinstance(row, dict) and row.get("skill") in wanted
+        ]
+    atomic_write_json(root / "metadata.json", {"skills_metadata": rows})
+    operation_directory = workspace / "run" / cluster / "ops" / str(op_index)
+    private_directory = private / "run" / cluster / "ops" / str(op_index)
+    for filename in (
+        "evolve-goal.json",
+        "verification-input.json",
+        "changelog.json",
+    ):
+        source = private_directory / filename
+        if source.is_file():
+            replace_path(source, operation_directory / filename)
+    preservation = private / "target/resource-preservation.json"
+    if preservation.is_file():
+        replace_path(
+            preservation, operation_directory / "resource-preservation.json"
+        )
+
+
+def restore_optimized_candidate(
+    worker: Path, workspace: Path, cluster: str, op_index: int, op: dict
+) -> None:
+    """Replay saved writes and deletions into a resumed operation worker."""
+    root = candidate_directory(workspace, cluster, op_index)
+    if not root.is_dir():
+        raise SystemExit(
+            f"optimized skill was not saved for {cluster} op {op_index}"
+        )
+    improved = root / "to_be_improved_skills"
+    _, removed = optimize_written_and_removed(op)
+    for name in removed:
+        destination = worker / "target/to_be_improved_skills" / name
+        if destination.exists():
+            shutil.rmtree(destination)
+    if improved.is_dir():
+        for skill_dir in improved.iterdir():
+            if skill_dir.is_dir():
+                replace_path(
+                    skill_dir,
+                    worker / "target/to_be_improved_skills" / skill_dir.name,
+                )
+    raw = root / "raw_skills"
+    if raw.is_dir():
+        for skill_dir in raw.iterdir():
+            if skill_dir.is_dir():
+                replace_path(
+                    skill_dir, worker / "target/raw_skills" / skill_dir.name
+                )
+    saved_metadata = root / "metadata.json"
+    if not saved_metadata.is_file():
+        return
+    incoming = json.loads(saved_metadata.read_text()).get("skills_metadata") or []
+    destination = worker / "target/to_be_improved_skills_metadata/metadata.json"
+    document = (
+        json.loads(destination.read_text())
+        if destination.is_file()
+        else {"skills_metadata": []}
+    )
+    rows = [
+        row
+        for row in document.get("skills_metadata") or []
+        if isinstance(row, dict) and row.get("skill") not in set(removed)
+    ]
+    index_by_name = {
+        row.get("skill"): index for index, row in enumerate(rows)
+    }
+    for row in incoming:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("skill")
+        if name in index_by_name:
+            rows[index_by_name[name]] = row
+        else:
+            rows.append(row)
+    document["skills_metadata"] = rows
+    atomic_write_json(destination, document)
+    detach_skill_changelogs(worker)
+    current = skill_inventory_names(worker / "target/to_be_improved_skills")
+    pipeline_contracts.validate_metadata(destination, current)
+
+
+def stage_saved_operation(
+    worker: Path, cluster: str, op_index: int, *, include_verification: bool
+) -> None:
+    """Point the worker's active run files at one saved operation."""
+    operation_directory = worker / "run" / cluster / "ops" / str(op_index)
+    for filename in (
+        "evolve-goal.json",
+        "verification-input.json",
+        "changelog.json",
+    ):
+        replace_path(
+            operation_directory / filename, worker / "run" / filename
+        )
+    if include_verification:
+        replace_path(
+            operation_directory / "verification.json",
+            worker / "run/verification.json",
+        )
+
+
+def changelog_phase_status(path: Path, phase: str) -> str:
+    if not path.is_file():
+        return ""
+    try:
+        document = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return ""
+    for marker in document.get("phase_markers") or []:
+        if isinstance(marker, dict) and marker.get("phase") == phase:
+            return str(marker.get("status") or "")
+    return ""
+
+
+def verification_has_feedback(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        document = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return False
+    return isinstance(document, dict) and isinstance(
+        document.get("feedback"), dict
+    )
+
+
+def resumable_operations(
+    workspace: Path, phase: str
+) -> tuple[list[dict[str, object]], list[str]]:
+    """Unaccepted operations that can restart at the requested phase."""
+    ready: list[dict[str, object]] = []
+    skipped: list[str] = []
+    run_root = workspace / "run"
+    if not run_root.is_dir():
+        return ready, skipped
+    for operation_directory in sorted(run_root.glob("*/ops/*")):
+        if not operation_directory.is_dir():
+            continue
+        if not str(operation_directory.name).isdigit():
+            continue
+        cluster = operation_directory.parent.parent.name
+        op_index = int(operation_directory.name)
+        label = f"{cluster} op {op_index}"
+        publication_path = operation_directory / "publication.json"
+        if publication_path.is_file():
+            try:
+                publication = json.loads(publication_path.read_text())
+            except json.JSONDecodeError:
+                publication = {}
+            if publication.get("accepted") is True:
+                continue
+        goal_path = operation_directory / "evolve-goal.json"
+        if not goal_path.is_file():
+            skipped.append(f"{label}: operation goal is missing")
+            continue
+        goal = pipeline_contracts.validate_goal(goal_path)
+        ops = goal["action"]["ops"]
+        if len(ops) != 1:
+            skipped.append(f"{label}: saved goal does not contain one operation")
+            continue
+        optimize_status = changelog_phase_status(
+            operation_directory / "changelog.json", "optimize"
+        )
+        if phase == "optimize":
+            if optimize_status == "completed":
+                skipped.append(
+                    f"{label}: optimize already completed; continue from verification"
+                )
+                continue
+        else:
+            if not candidate_directory(workspace, cluster, op_index).is_dir():
+                skipped.append(f"{label}: optimized skill was not saved")
+                continue
+            if optimize_status != "completed":
+                skipped.append(f"{label}: optimize did not finish")
+                continue
+        if phase == "judge" and not verification_has_feedback(
+            operation_directory / "verification.json"
+        ):
+            skipped.append(f"{label}: verification has no result to judge")
+            continue
+        op = ops[0]
+        affected = set(skill_names_mod.skill_names(op))
+        ready.append(
+            {
+                "cluster": cluster,
+                "op_index": op_index,
+                "op": op,
+                "affected": affected,
+                "conflicts": affected or {"*"},
+                "bundle": {},
+                "rank": {},
+            }
+        )
+    return ready, skipped
+
+
+def run_verification_and_judge(
+    *,
+    workspace: Path,
+    private: Path,
+    cluster: str,
+    op_index: int,
+    op: dict,
+    suffix: str,
+    attempt: int,
+    op_metadata: dict[str, object],
+    auth: dict[str, str],
+    model: str | None,
+    install_agent: bool,
+    stage_box: dict[str, str],
+    start_stage: str,
+) -> str:
+    """Run verification and judge, or judge alone when verification is saved."""
+    if start_stage == "verifiter":
+        stage_box["stage"] = "verifiter"
+        mark_operation_phase(
+            private,
+            cluster,
+            op_index,
+            "verification",
+            "running",
+        )
+        write_status(workspace, "verifiter", suffix, "started")
+        verification = run_per_skill_verification(
+            private,
+            auth=auth,
+            model=model,
+            install_agent=install_agent,
+            suffix=suffix,
+            metadata={**op_metadata, "attempt": attempt},
+        )
+        execute_configured_held_out_replay(
+            private,
+            verification,
+            op,
+            held_out_workspace=workspace,
+        )
+        verification_data = pipeline_contracts.validate_verification(
+            verification,
+            judged=False,
+            expected_skills=set(skill_names_mod.skill_names(op)),
+        )
+        mark_operation_phase(
+            private,
+            cluster,
+            op_index,
+            "verification",
+            "completed",
+        )
+        operation_directory = (
+            workspace / "run" / cluster / "ops" / str(op_index)
+        )
+        replace_path(verification, operation_directory / "verification.json")
+        saved_changelog = (
+            private / "run" / cluster / "ops" / str(op_index) / "changelog.json"
+        )
+        if saved_changelog.is_file():
+            replace_path(saved_changelog, operation_directory / "changelog.json")
+        replay_outputs = validate_replay_artifacts(private, verification_data)
+        complete_session(
+            private,
+            "verifiter",
+            suffix,
+            [verification, *replay_outputs],
+        )
+    else:
+        verification = private / "run/verification.json"
+        require_path(verification, "verification")
+    stage_box["stage"] = "judge"
+    mark_operation_phase(private, cluster, op_index, "judge", "running")
+    write_status(workspace, "judge", suffix, "started")
+    append_execution_event(private, "judge", "started")
+    try:
+        with pipeline_metrics.span(
+            metrics_workspace(private),
+            "judge",
+            suffix,
+            "deterministic",
+            metadata={
+                **op_metadata,
+                "attempt": attempt,
+                "formula": "overall_status",
+            },
+        ):
+            action = apply_judge_formula(verification)
+    except BaseException:
+        append_execution_event(private, "judge", "failed")
+        raise
+    else:
+        append_execution_event(private, "judge", "done")
+    mark_operation_phase(
+        private,
+        cluster,
+        op_index,
+        "judge",
+        "completed",
+        f"decision: {action}",
+    )
+    _emit_judge_decision(workspace, cluster, op_index, verification, attempt)
+    archive_verification(private, cluster, op_index)
+    archived = private / "run" / cluster / "ops" / str(op_index)
+    complete_session(
+        private,
+        "judge",
+        suffix,
+        [
+            archived / "verification.json",
+            archived / "judge.json",
+            archived / "changelog.json",
+            archived / "evolve-goal.json",
+        ],
+    )
+    return action
+
+
+def settle_failed_operation(
+    *,
+    workspace: Path,
+    private: Path,
+    cluster: str,
+    op_index: int,
+    current_stage: str,
+    suffix: str,
+    suffixes: list[str],
+    task: dict[str, object],
+    error: BaseException,
+) -> dict[str, object]:
+    """Record one lane failure and keep any optimized skill already saved."""
+    reason = failure_text(error)
+    phase = {
+        "optimize": "optimize",
+        "verifiter": "verification",
+        "judge": "judge",
+    }.get(current_stage)
+    if phase is not None:
+        try:
+            mark_operation_phase(
+                private, cluster, op_index, phase, "failed", reason
+            )
+            remaining = OPERATION_PHASES[OPERATION_PHASES.index(phase) + 1 :]
+            if remaining:
+                skip_operation_phases(
+                    private,
+                    cluster,
+                    op_index,
+                    remaining,
+                    f"blocked by failed {phase} phase",
+                )
+            failed_directory = finalize_unexecuted_operation(
+                private,
+                cluster,
+                op_index,
+                status="failed",
+                reason=f"{phase} failed: {reason}",
+            )
+            target_directory = (
+                workspace / "run" / cluster / "ops" / str(op_index)
+            )
+            for filename in (
+                "evolve-goal.json",
+                "verification-input.json",
+                "verification.json",
+                "judge.json",
+                "changelog.json",
+            ):
+                if filename == "verification.json" and verification_has_feedback(
+                    target_directory / filename
+                ):
+                    continue
+                replace_path(
+                    failed_directory / filename, target_directory / filename
+                )
+            write_publication(
+                workspace,
+                cluster,
+                op_index,
+                accepted=False,
+                reason=f"{phase}-failed",
+            )
+        except BaseException as archival_error:
+            note = (
+                "failed to archive the operation failure: "
+                f"{failure_text(archival_error)}"
+            )
+            write_status(
+                workspace,
+                current_stage,
+                suffix,
+                "failed",
+                error=f"{reason}; {note}",
+            )
+    for done_suffix in suffixes:
+        merge_worker_statuses(private, workspace, done_suffix)
+    write_status(workspace, current_stage, suffix, "failed", error=reason)
+    return {
+        **task,
+        "worker": private,
+        "suffixes": suffixes,
+        "judge_action": None,
+        "failed": True,
+        "published": True,
+    }
+
+
+def fanout_operations(
+    workspace: Path,
+    run_id: str,
+    clusters: list[str],
+    workers: int,
+    auth: dict[str, str],
+    model: str | None,
+    install_agent: bool,
+    max_ops_per_skill: int | None = None,
+    min_super_score: float | None = None,
+) -> None:
+    (workspace / "run/evolve-goal.json").unlink(missing_ok=True)
+    (workspace / "run/verification.json").unlink(missing_ok=True)
+    tasks: list[dict[str, object]] = []
+    for cluster in clusters:
+        infrastructure_blocked = infrastructure_evolution_blocked(
+            workspace, cluster
+        )
+        cluster_goal = workspace / "run" / cluster / "evolve-goal.json"
+        goal = pipeline_contracts.validate_goal(cluster_goal)
+        operations = (goal.get("action") or {}).get("ops") or []
+        resource_plan_changes = [
+            reconcile_inherited_resource_plan(workspace, op)
+            for op in operations
+        ]
+        if any(resource_plan_changes):
+            atomic_write_json(cluster_goal, goal)
+            goal = pipeline_contracts.validate_goal(cluster_goal)
+            operations = (goal.get("action") or {}).get("ops") or []
+        if not operations:
+            finalize_no_change_scope(
+                workspace, run_id, cluster, cluster_goal
+            )
+            continue
+        for op_index, op in enumerate(operations, start=1):
+            op_goal = materialize_op_goal(
+                workspace,
+                cluster,
+                op_index,
+                goal,
+                op,
+                activate=False,
+            )
+            initialize_operation_changelog(
+                workspace, op, run_id, cluster, op_index
+            )
+            materialize_verification_input(
+                workspace,
+                json.loads(op_goal.read_text()),
+                op,
+                run_id,
+                cluster,
+                op_index,
+                out=op_goal.parent / "verification-input.json",
+            )
+            if infrastructure_blocked:
+                skip_operation_phases(
+                    workspace,
+                    cluster,
+                    op_index,
+                    ("optimize", "verification", "judge"),
+                    INFRASTRUCTURE_REFUSAL,
+                )
+                drop_created_skills(
+                    workspace, created_skill_names(op)
+                )
+                write_publication(
+                    workspace,
+                    cluster,
+                    op_index,
+                    accepted=False,
+                    reason=INFRASTRUCTURE_REFUSAL,
+                )
+                finalize_unexecuted_operation(
+                    workspace,
+                    cluster,
+                    op_index,
+                    status="skipped",
+                    reason=INFRASTRUCTURE_REFUSAL,
+                )
+                continue
+            try:
+                enforce_creation_policy(workspace, cluster, goal, op)
+            except BaseException as error:
+                skip_operation_phases(
+                    workspace,
+                    cluster,
+                    op_index,
+                    ("optimize", "verification", "judge"),
+                    f"policy gate: {error}",
+                )
+                reason = f"policy gate: {error}"
+                finalize_unexecuted_operation(
+                    workspace,
+                    cluster,
+                    op_index,
+                    status="skipped",
+                    reason=reason,
+                )
+                write_publication(
+                    workspace,
+                    cluster,
+                    op_index,
+                    accepted=False,
+                    reason="policy-gate",
+                )
+                continue
+            affected = set(skill_names_mod.skill_names(op))
+            skill_rows = op.get("skills") or []
+            skill_goal = ""
+            if skill_rows and isinstance(skill_rows[0], dict):
+                skill_goal = str(skill_rows[0].get("goal") or "")
+            tasks.append(
+                {
+                    "cluster": cluster,
+                    "op_index": op_index,
+                    "op": op,
+                    "op_goal": op_goal,
+                    "affected": affected,
+                    "conflicts": affected or {"*"},
+                    "confidence": _finding_confidence(workspace, cluster),
+                    "skill_goal": skill_goal,
+                }
+            )
+            tasks[-1]["rank"] = rank_edit(workspace, tasks[-1])
+            tasks[-1]["confidence"] = tasks[-1]["rank"]["confidence"]
+    tasks = reduce_operation_tasks(workspace, tasks)
+    cap = configured_max_ops_per_skill(max_ops_per_skill)
+    gate = configured_min_super_score(min_super_score)
+    tasks = bundle_same_skill_updates(workspace, tasks, cap, gate)
+    _emit_edit_decisions(workspace, cap, gate)
+
+    batches = operation_batches(tasks)
+    batch_state = {
+        "ready_us": time.time_ns() // 1000,
+        "batch_index": 1,
+        "batch_count": len(batches),
+        "batch_size": 0,
+    }
+    publish_lock = threading.Lock()
+
+    def publish_now(result: dict[str, object]) -> None:
+        with publish_lock:
+            publish_operation_result(workspace, result)
+        result["published"] = True
+
+    def work(task_object: object) -> object:
+        task = task_object
+        cluster = str(task["cluster"])
+        op_index = int(task["op_index"])
+        op = task["op"]
+        item = f"{run_id}-{cluster}-op-{op_index}"
+        conflicts = sorted(str(name) for name in task["conflicts"])
+        queue_wait_ms = record_queue(
+            workspace,
+            "operation-queue",
+            item,
+            int(batch_state["ready_us"]),
+            {
+                "workers": workers,
+                "pool_items": batch_state["batch_size"],
+                "batch_index": batch_state["batch_index"],
+                "batch_count": batch_state["batch_count"],
+                "conflicts": conflicts,
+            },
+        )
+        private = copy_worker(workspace, "operations", item)
+        private_op_goal = (
+            private / "run" / cluster / "ops" / str(op_index) / "evolve-goal.json"
+        )
+        shutil.copy2(private_op_goal, private / "run/evolve-goal.json")
+        bundle = task.get("bundle") if isinstance(task.get("bundle"), dict) else {}
+        bundle_note = ""
+        if bundle:
+            bundle_note = (
+                f" bundle.selected lists {len(bundle.get('selected') or [])} "
+                "source edits of this skill. Apply every section, directory, and removal "
+                "goal in this one op. Verification and judge run once, with --op 1."
+            )
+        snapshot_optimize_sources(private, op)
+        optimize_input = prepare_optimize_input(private, op)
+        context = optimize_session_context(
+            cluster,
+            op_index,
+            op,
+            bundle_note,
+            finding_resource_contracts(private, cluster),
+        )
+        action = "pending"
+        attempt = 0
+        suffixes: list[str] = []
+        current_stage = "optimize"
+        suffix = f"{item}-try-1"
+        op_metadata = {
+            "workers": workers,
+            "pool_items": batch_state["batch_size"],
+            "batch_index": batch_state["batch_index"],
+            "batch_count": batch_state["batch_count"],
+            "conflicts": conflicts,
+            "operation": str(op.get("op") or ""),
+            "queue_wait_ms": queue_wait_ms,
+            "bundle_size": len(bundle.get("selected") or []) or 1,
+            "super_score": (task.get("rank") or {}).get("super_score"),
+            "retry_budget": RETRY_BUDGET,
+            "max_attempts": RETRY_BUDGET + 1,
+            **_rank_fields(task),
+        }
+        stage_box = {"stage": "optimize"}
+        try:
+            while action == "pending" and attempt < RETRY_BUDGET + 1:
+                attempt += 1
+                suffix = f"{item}-try-{attempt}"
+                suffixes.append(suffix)
+                current_stage = "optimize"
+                stage_box["stage"] = "optimize"
+                mark_operation_phase(
+                    private,
+                    cluster,
+                    op_index,
+                    "optimize",
+                    "running",
+                )
+                write_status(
+                    workspace,
+                    current_stage,
+                    suffix,
+                    "started",
+                    skills=skill_names_mod.skill_names(op),
+                )
+                run_session(
+                    current_stage,
+                    private,
+                    instruction(current_stage, context),
+                    auth,
+                    model,
+                    install_agent,
+                    suffix,
+                    {**op_metadata, "attempt": attempt},
+                    input_root=optimize_input,
+                )
+                collect_optimize_input(private, op)
+                materialize_created_skill_metadata(
+                    private, op, cluster, run_id
+                )
+                optimized_outputs = validate_optimized_op(private, op)
+                changelog = materialize_operation_changelog(
+                    private,
+                    op,
+                    run_id,
+                    cluster,
+                    op_index,
+                )
+                verification_input = materialize_verification_input(
+                    private,
+                    json.loads(private_op_goal.read_text()),
+                    op,
+                    run_id,
+                    cluster,
+                    op_index,
+                )
+                complete_session(
+                    private,
+                    current_stage,
+                    suffix,
+                    [
+                        private_op_goal,
+                        *optimized_outputs,
+                        changelog,
+                        verification_input,
+                    ],
+                )
+                preserve_optimized_candidate(
+                    workspace, private, cluster, op_index, op
+                )
+                action = run_verification_and_judge(
+                    workspace=workspace,
+                    private=private,
+                    cluster=cluster,
+                    op_index=op_index,
+                    op=op,
+                    suffix=suffix,
+                    attempt=attempt,
+                    op_metadata=op_metadata,
+                    auth=auth,
+                    model=model,
+                    install_agent=install_agent,
+                    stage_box=stage_box,
+                    start_stage="verifiter",
+                )
+            result = {
+                **task,
+                "worker": private,
+                "suffixes": suffixes,
+                "judge_action": action,
+            }
+            publish_now(result)
+            return result
+        except BaseException as error:
+            return settle_failed_operation(
+                workspace=workspace,
+                private=private,
+                cluster=cluster,
+                op_index=op_index,
+                current_stage=stage_box["stage"],
+                suffix=suffix,
+                suffixes=suffixes,
+                task=task,
+                error=error,
+            )
+
+    for batch_index, batch in enumerate(batches, start=1):
+        batch_state["batch_index"] = batch_index
+        batch_state["batch_size"] = len(batch)
+        try:
+            results = run_pool(batch, workers, work)
+        except BaseException:
+            remove_worker_stage(workspace, "operations")
+            raise
+        try:
+            for result in results:
+                if result.get("failed") or result.get("published"):
+                    continue
+                publish_now(result)
+        finally:
+            for result in results:
+                remove_worker_workspace(result["worker"])
+
+
+def continue_operations(
+    workspace: Path,
+    run_id: str,
+    phase: str,
+    workers: int,
+    auth: dict[str, str],
+    model: str | None,
+    install_agent: bool,
+) -> list[str]:
+    """Restart unaccepted operations at optimize, verification, or judge."""
+    tasks, skipped = resumable_operations(workspace, phase)
+    for note in skipped:
+        print(f"skip {note}", flush=True)
+    if not tasks:
+        print(f"no saved operation to continue from {phase}", flush=True)
+        return []
+    print(
+        f"continuing {len(tasks)} operation"
+        f"{'' if len(tasks) == 1 else 's'} from {phase}",
+        flush=True,
+    )
+    publish_lock = threading.Lock()
+
+    def publish_now(result: dict[str, object]) -> None:
+        with publish_lock:
+            publish_operation_result(workspace, result)
+        result["published"] = True
+
+    def work(task_object: object) -> object:
+        task = task_object
+        cluster = str(task["cluster"])
+        op_index = int(task["op_index"])
+        op = task["op"]
+        item = f"{run_id}-{cluster}-op-{op_index}-resume-1"
+        conflicts = sorted(str(name) for name in task["conflicts"])
+        private = copy_worker(workspace, "operations", item)
+        suffix = item
+        suffixes = [suffix]
+        stage_name = (
+            "optimize"
+            if phase == "optimize"
+            else "verifiter" if phase == "verification" else "judge"
+        )
+        stage_box = {"stage": stage_name}
+        op_metadata = {
+            "workers": workers,
+            "pool_items": len(tasks),
+            "conflicts": conflicts,
+            "operation": str(op.get("op") or ""),
+            "resume_from": phase,
+            "attempt": 1,
+        }
+        try:
+            if phase == "optimize":
+                private_op_goal = (
+                    private / "run" / cluster / "ops" / str(op_index)
+                    / "evolve-goal.json"
+                )
+                shutil.copy2(private_op_goal, private / "run/evolve-goal.json")
+                snapshot_optimize_sources(private, op)
+                optimize_input = prepare_optimize_input(private, op)
+                context = optimize_session_context(
+                    cluster,
+                    op_index,
+                    op,
+                    "",
+                    finding_resource_contracts(private, cluster),
+                )
+                mark_operation_phase(
+                    private, cluster, op_index, "optimize", "running"
+                )
+                write_status(
+                    workspace,
+                    "optimize",
+                    suffix,
+                    "started",
+                    skills=skill_names_mod.skill_names(op),
+                )
+                run_session(
+                    "optimize",
+                    private,
+                    instruction("optimize", context),
+                    auth,
+                    model,
+                    install_agent,
+                    suffix,
+                    op_metadata,
+                    input_root=optimize_input,
+                )
+                collect_optimize_input(private, op)
+                materialize_created_skill_metadata(
+                    private, op, cluster, run_id
+                )
+                optimized_outputs = validate_optimized_op(private, op)
+                changelog = materialize_operation_changelog(
+                    private, op, run_id, cluster, op_index
+                )
+                verification_input = materialize_verification_input(
+                    private,
+                    json.loads(private_op_goal.read_text()),
+                    op,
+                    run_id,
+                    cluster,
+                    op_index,
+                )
+                complete_session(
+                    private,
+                    "optimize",
+                    suffix,
+                    [
+                        private_op_goal,
+                        *optimized_outputs,
+                        changelog,
+                        verification_input,
+                    ],
+                )
+                preserve_optimized_candidate(
+                    workspace, private, cluster, op_index, op
+                )
+                stage_box["stage"] = "verifiter"
+                start_stage = "verifiter"
+            else:
+                restore_optimized_candidate(
+                    private, workspace, cluster, op_index, op
+                )
+                stage_saved_operation(
+                    private,
+                    cluster,
+                    op_index,
+                    include_verification=phase == "judge",
+                )
+                start_stage = stage_name
+            action = run_verification_and_judge(
+                workspace=workspace,
+                private=private,
+                cluster=cluster,
+                op_index=op_index,
+                op=op,
+                suffix=suffix,
+                attempt=1,
+                op_metadata=op_metadata,
+                auth=auth,
+                model=model,
+                install_agent=install_agent,
+                stage_box=stage_box,
+                start_stage=start_stage,
+            )
+            result = {
+                **task,
+                "worker": private,
+                "suffixes": suffixes,
+                "judge_action": action,
+            }
+            publish_now(result)
+            return result
+        except BaseException as error:
+            return settle_failed_operation(
+                workspace=workspace,
+                private=private,
+                cluster=cluster,
+                op_index=op_index,
+                current_stage=stage_box["stage"],
+                suffix=suffix,
+                suffixes=suffixes,
+                task=task,
+                error=error,
+            )
+
+    try:
+        results = run_pool(tasks, workers, work)
+    except BaseException:
+        remove_worker_stage(workspace, "operations")
+        raise
+    for result in results:
+        remove_worker_workspace(result["worker"])
+    return sorted({str(task["cluster"]) for task in tasks})
+
+
+def write_pipeline_summary(workspace: Path, clusters: list[str]) -> Path:
+    scopes: list[dict[str, object]] = []
+    operations: list[dict[str, object]] = []
+    reduction_path = workspace / "run/goal-reduction.json"
+    reduction = json.loads(reduction_path.read_text()) if reduction_path.is_file() else {}
+    decisions = {
+        (row["cluster"], row["op_index"]): row
+        for row in reduction.get("decisions") or []
+    }
+    for cluster in sorted(clusters):
+        goal_path = workspace / "run" / cluster / "evolve-goal.json"
+        goal = pipeline_contracts.validate_goal(goal_path)
+        action = goal["action"]
+        scope_ops = action["ops"]
+        scopes.append(
+            {
+                "scope": cluster,
+                "goal": goal_path.relative_to(workspace).as_posix(),
+                "disposition": action.get("disposition", "change"),
+                "reason": action.get("reason"),
+                "operation_count": len(scope_ops),
+            }
+        )
+        for op_index, op in enumerate(scope_ops, start=1):
+            operation_root = (
+                Path("run") / cluster / "ops" / str(op_index)
+            )
+            decision = decisions.get((cluster, op_index), {"decision": "selected"})
+            verification_cluster = str(
+                decision.get("selected_cluster", cluster)
+            )
+            verification_index = int(
+                decision.get("selected_op_index", op_index)
+            )
+            verification_path = (
+                workspace
+                / "run"
+                / verification_cluster
+                / "ops"
+                / str(verification_index)
+                / "verification.json"
+            )
+            publication_path = (
+                workspace
+                / "run"
+                / cluster
+                / "ops"
+                / str(op_index)
+                / "publication.json"
+            )
+            publication = (
+                json.loads(publication_path.read_text())
+                if publication_path.is_file()
+                else {
+                    "accepted": False,
+                    "reason": "missing-publication",
+                }
+            )
+            accepted = bool(publication.get("accepted", False))
+            judge_action_value = None
+            verification_rel = None
+            artifact_error = None
+            verification_document = (
+                json.loads(verification_path.read_text())
+                if verification_path.is_file()
+                else {}
+            )
+            completed_verification = isinstance(
+                verification_document.get("feedback"), dict
+            )
+            if completed_verification:
+                verification = pipeline_contracts.validate_verification(
+                    verification_path,
+                    judged=True,
+                )
+                judge_action_value = verification["feedback"]["action"]["op"]
+                verification_rel = verification_path.relative_to(
+                    workspace
+                ).as_posix()
+            elif accepted:
+                artifact_error = (
+                    "accepted operation has no completed verification"
+                )
+                if verification_path.is_file():
+                    verification_rel = verification_path.relative_to(
+                        workspace
+                    ).as_posix()
+            elif verification_path.is_file():
+                verification_rel = verification_path.relative_to(
+                    workspace
+                ).as_posix()
+            operations.append(
+                {
+                    "scope": cluster,
+                    "op_index": op_index,
+                    "op": op["op"],
+                    "skills": sorted(skill_names_mod.skill_names(op)),
+                    "reduction_decision": decision["decision"],
+                    "accepted": accepted,
+                    "publication_reason": publication.get("reason"),
+                    "publication_outcome": publication.get("outcome"),
+                    "artifact_bundle": operation_root.as_posix(),
+                    "goal": (operation_root / "evolve-goal.json").as_posix(),
+                    "verification_input": (
+                        operation_root / "verification-input.json"
+                    ).as_posix(),
+                    "local_verification": (
+                        operation_root / "verification.json"
+                    ).as_posix(),
+                    "verification": verification_rel,
+                    "judge": (operation_root / "judge.json").as_posix(),
+                    "changelog": (
+                        operation_root / "changelog.json"
+                    ).as_posix(),
+                    "judge_action": judge_action_value,
+                    "artifact_error": artifact_error,
+                }
+            )
+    selection_path = workspace / "run/trace-selection.json"
+    selection = (
+        json.loads(selection_path.read_text()) if selection_path.is_file() else {}
+    )
+    inherited = sorted(
+        value
+        for value in (selection.get("candidate_skills") or [])
+        if isinstance(value, str)
+    )
+    if not selection_path.is_file():
+        inherited = sorted(
+            skill_inventory_names(workspace / "target/to_be_improved_skills")
+        )
+    accepted = [row for row in operations if row["accepted"]]
+    rejected = [row for row in operations if not row["accepted"]]
+    accepted_skills = sorted(
+        {
+            skill
+            for row in accepted
+            for skill in row["skills"]
+            if isinstance(skill, str)
+        }
+    )
+    no_change_scopes = [
+        row["scope"] for row in scopes if row["disposition"] == "no_change"
+    ]
+    document = {
+        "schema_version": 1,
+        "outcome": {
+            "inherited_skill_count": len(inherited),
+            "inherited_skills": inherited,
+            "proposed_operation_count": len(operations),
+            "accepted_operation_count": len(accepted),
+            "rejected_operation_count": len(rejected),
+            "accepted_changed_skills": accepted_skills,
+            "no_change_scope_count": len(no_change_scopes),
+            "zero_accepted_changes": not accepted,
+        },
+        "scopes": scopes,
+        "operations": operations,
+        "no_change_scopes": no_change_scopes,
+    }
+    destination = workspace / "run/pipeline-summary.json"
+    destination.write_text(
+        json.dumps(document, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
+    )
+    update_operation_coverage(workspace)
+    return destination
+
+
+def update_operation_coverage(workspace: Path) -> Path:
+    """Aggregate real-run mutation evidence for convergence decisions."""
+    workspace_root = workspace.parents[1]
+    runs_root = workspace_root / "runs"
+    kinds = ("create", "update", "delete", "merge", "split")
+    coverage: dict[str, dict[str, object]] = {
+        kind: {
+            "proposed": 0,
+            "accepted": 0,
+            "rejected": 0,
+            "accepted_runs": [],
+        }
+        for kind in kinds
+    }
+    for summary_path in sorted(runs_root.glob("*/run/pipeline-summary.json")):
+        try:
+            summary = json.loads(summary_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        run_id = summary_path.parents[1].name
+        for row in summary.get("operations") or []:
+            if not isinstance(row, dict) or row.get("op") not in coverage:
+                continue
+            bucket = coverage[str(row["op"])]
+            bucket["proposed"] = int(bucket["proposed"]) + 1
+            outcome = "accepted" if row.get("accepted") else "rejected"
+            bucket[outcome] = int(bucket[outcome]) + 1
+            if row.get("accepted") and run_id not in bucket["accepted_runs"]:
+                bucket["accepted_runs"].append(run_id)
+    document = {
+        "schema_version": 1,
+        "generated_at": datetime.now(UTC).isoformat(),
+        "semantics": (
+            "Counts validated pipeline-summary operations from retained real "
+            "runs; unit-test coverage is intentionally excluded."
+        ),
+        "operations": coverage,
+        "unverified_real_operations": [
+            kind for kind in kinds if int(coverage[kind]["accepted"]) == 0
+        ],
+    }
+    destination = workspace_root / "operation-coverage.json"
+    atomic_write_json(destination, document)
+    return destination
+
+
+OPTIMIZE_AVOIDANCE = """
+Important. These reject the skill. Avoid them.
+
+- Description: put it on the same line as `description:`. Do not write
+  `description: >` or `description: |`. The checker reads only that line, so
+  `>` is the description and the run fails before verification with
+  "frontmatter description contains angle brackets". No `<` or `>` on that line.
+- Triggers: when the goal says a first case and a later restatement are each
+  enough, do not write "all of the following are true" and do not make the
+  restatement a required condition. That wording scored 0.99 and still failed:
+  When to Use required every bullet at once, so a first authorization that had
+  not yet been restated was outside the skill.
+- Headings: a required section is a level-2 heading, `## Overview`. `# Overview`
+  is reported missing.
+""".strip()
+
+
+def _clip_changelog(text: object) -> str:
+    collapsed = " ".join(str(text).split())
+    if len(collapsed) <= CHANGELOG_SUMMARY_LIMIT:
+        return collapsed
+    return collapsed[: CHANGELOG_SUMMARY_LIMIT - 1].rstrip() + "…"
+
+
+def _compact_number(value: float) -> str:
+    return f"{value:.4f}".rstrip("0").rstrip(".") or "0"
+
+
+def _changelog_filename(skill: str) -> str | None:
+    if (
+        not skill
+        or skill in {".", ".."}
+        or "/" in skill
+        or "\\" in skill
+        or skill.startswith(".")
+    ):
+        return None
+    return f"{skill}.md"
+
+
+def _phase_line(entry: dict | None) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    phase = entry.get("phase")
+    finding = entry.get("finding_id")
+    day = entry.get("date")
+    if not isinstance(finding, str) or not finding or not isinstance(day, str):
+        return ""
+    if phase == "diagnosis":
+        kind = f"diagnosis {finding}"
+    elif phase == "goal":
+        kind = f"goal {entry.get('operation') or 'no_change'} {finding}"
+    elif phase == "verification":
+        status = entry.get("status")
+        op_index = entry.get("op_index")
+        if status not in {"pass", "fail"} or not isinstance(op_index, int):
+            return ""
+        kind = f"verify {status} {finding}/{op_index}"
+    else:
+        return ""
+    summary = _clip_changelog(entry.get("summary") or "")
+    return f"- {day} {kind}" + (f" | {summary}" if summary else "")
+
+
+def _operation_line(change: dict) -> str:
+    operation = change.get("operation")
+    finding = change.get("finding_id")
+    op_index = change.get("op_index")
+    day = change.get("date")
+    if operation not in {"create", "update", "delete", "merge", "split"}:
+        return ""
+    if not isinstance(finding, str) or not isinstance(day, str):
+        return ""
+    if not isinstance(op_index, int) or isinstance(op_index, bool):
+        return ""
+    sections = ",".join(
+        value
+        for value in change.get("sections") or []
+        if isinstance(value, str) and value
+    )
+    directories = ",".join(
+        value
+        for value in change.get("directories") or []
+        if isinstance(value, str) and value
+    )
+    detail = " ".join(part for part in (directories, sections) if part)
+    if len(detail) > CHANGELOG_SUMMARY_LIMIT:
+        count = sections.count(",") + (1 if sections else 0)
+        detail = f"{count} sections"
+        if directories:
+            detail = f"{directories} {detail}"
+    if not detail and operation == "delete":
+        detail = "removed"
+    return (
+        f"- {day} {operation} {finding}/{op_index} | {_clip_changelog(detail)}"
+    )
+
+
+def lines_from_history(history: list) -> list[str]:
+    lines: list[str] = []
+    for record in history:
+        if not isinstance(record, dict):
+            continue
+        if record.get("phase") in {"diagnosis", "goal", "verification"}:
+            line = _phase_line(record)
+        else:
+            line = _operation_line(record)
+        if line:
+            lines.append(line)
+    return lines
+
+
+def append_changelog_lines(
+    directory: Path, skill: str, lines: list[str]
+) -> None:
+    """Append changelog lines. Existing lines are never rewritten."""
+    filename = _changelog_filename(skill)
+    if filename is None or not lines:
+        return
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / filename
+    if not path.is_file():
+        path.write_text(f"# {skill}\n")
+    existing = path.read_text()
+    keys = {
+        line.split(" | ", 1)[0]
+        for line in existing.splitlines()
+        if line.startswith("- ")
+    }
+    fresh: list[str] = []
+    for line in lines:
+        if not line.startswith("- "):
+            continue
+        key = line.split(" | ", 1)[0]
+        if key in keys:
+            continue
+        keys.add(key)
+        fresh.append(line)
+    if not fresh:
+        return
+    with path.open("a", encoding="utf-8") as handle:
+        if existing and not existing.endswith("\n"):
+            handle.write("\n")
+        handle.write("\n".join(fresh) + "\n")
+
+
+def merge_changelog_file(source: Path, destination: Path) -> None:
+    """Append lines from source that destination does not already have."""
+    if not source.is_file():
+        return
+    skill = source.stem
+    append_changelog_lines(
+        destination.parent,
+        skill,
+        [
+            line
+            for line in source.read_text().splitlines()
+            if line.startswith("- ")
+        ],
+    )
+
+
+def _run_day(workspace: Path) -> str:
+    match = re.search(r"@(\d{4}-\d{2}-\d{2})", workspace.name)
+    if match:
+        return match.group(1)
+    return datetime.now(UTC).date().isoformat()
+
+
+def _read_json_object(path: Path) -> dict:
+    if not path.is_file():
+        return {}
+    try:
+        value = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _changelog_skills(workspace: Path, cluster: str) -> list[str]:
+    """Skills this finding diagnosed, targeted, or recalled."""
+    names: list[str] = []
+    goal = _read_json_object(workspace / "run" / cluster / "evolve-goal.json")
+    improve = (goal.get("goal") or {}).get("improve_skills") or []
+    if isinstance(improve, list):
+        names.extend(value for value in improve if isinstance(value, str) and value)
+    for op in (goal.get("action") or {}).get("ops") or []:
+        if isinstance(op, dict):
+            names.extend(skill_names_mod.skill_names(op))
+    matching = _read_json_object(
+        workspace / "run" / cluster / "label-matching.json"
+    )
+    for group in matching.get("clusters") or []:
+        if not isinstance(group, dict):
+            continue
+        if group.get("cluster") not in {cluster, None} and cluster != "cut":
+            continue
+        for row in group.get("skills") or []:
+            if isinstance(row, dict) and isinstance(row.get("skill"), str):
+                names.append(row["skill"])
+    ordered: list[str] = []
+    for name in names:
+        if name not in ordered:
+            ordered.append(name)
+    return ordered
+
+
+def _goal_operation(goal: dict, skill: str) -> str:
+    for op in (goal.get("action") or {}).get("ops") or []:
+        if isinstance(op, dict) and skill in skill_names_mod.skill_names(op):
+            return str(op.get("op") or "no_change")
+    return "no_change"
+
+
+def skill_phase_entries(
+    workspace: Path, skill: str, run_id: str | None = None
+) -> list[dict[str, object]]:
+    """Diagnosis, goal, and verification notes for one skill."""
+    run_name = run_id or workspace.name
+    day = _run_day(workspace if run_id is None else Path(run_name))
+    if run_id is not None:
+        match = re.search(r"@(\d{4}-\d{2}-\d{2})", run_id)
+        day = match.group(1) if match else datetime.now(UTC).date().isoformat()
+    entries: list[dict[str, object]] = []
+    run_root = workspace / "run"
+    if not run_root.is_dir():
+        return entries
+    for goal_path in sorted(run_root.glob("*/evolve-goal.json")):
+        cluster = goal_path.parent.name
+        if skill not in _changelog_skills(workspace, cluster):
+            continue
+        diagnosis = _read_json_object(goal_path.parent / "diagnosis.json")
+        gaps = [
+            str(item.get("description") or item.get("reasoning") or "")
+            for item in diagnosis.get("skill_capabilities_missing") or []
+            if isinstance(item, dict)
+        ]
+        goal = _read_json_object(goal_path)
+        action = goal.get("action") if isinstance(goal.get("action"), dict) else {}
+        entries.append(
+            {
+                "id": f"{run_name}:{cluster}:{skill}:diagnosis",
+                "skill": skill,
+                "phase": "diagnosis",
+                "run_id": run_name,
+                "finding_id": cluster,
+                "date": day,
+                "summary": _clip_changelog(" ".join(gaps)),
+            }
+        )
+        entries.append(
+            {
+                "id": f"{run_name}:{cluster}:{skill}:goal",
+                "skill": skill,
+                "phase": "goal",
+                "operation": _goal_operation(goal, skill),
+                "run_id": run_name,
+                "finding_id": cluster,
+                "date": day,
+                "summary": _clip_changelog(
+                    action.get("reason") or goal.get("plan") or goal.get("reasoning")
+                ),
+            }
+        )
+        ops_root = goal_path.parent / "ops"
+        if not ops_root.is_dir():
+            continue
+        for verification_path in sorted(ops_root.glob("*/verification.json")):
+            if not verification_path.parent.name.isdigit():
+                continue
+            op_index = int(verification_path.parent.name)
+            verification = _read_json_object(verification_path)
+            feedback = verification.get("feedback") or {}
+            row = next(
+                (
+                    item
+                    for item in feedback.get("per_skill") or []
+                    if isinstance(item, dict) and item.get("skill") == skill
+                ),
+                None,
+            )
+            if row is None:
+                continue
+            status = row.get("status")
+            if status not in {"pass", "fail"}:
+                continue
+            score = row.get("score")
+            feedback = str(row.get("feedback") or "")
+            if isinstance(score, (int, float)) and not isinstance(score, bool):
+                feedback = f"{_compact_number(float(score))} {feedback}"
+            entries.append(
+                {
+                    "id": f"{run_name}:{cluster}:{op_index}:{skill}:verification",
+                    "skill": skill,
+                    "phase": "verification",
+                    "operation": _goal_operation(goal, skill),
+                    "run_id": run_name,
+                    "finding_id": cluster,
+                    "op_index": op_index,
+                    "date": day,
+                    "status": status,
+                    "summary": _clip_changelog(feedback),
+                }
+            )
+    return entries
+
+
+def verification_changelog_entry(
+    workspace: Path, cluster: str, op_index: int, skill: str
+) -> dict[str, object] | None:
+    changelog = _read_json_object(
+        workspace / "run" / cluster / "ops" / str(op_index) / "changelog.json"
+    )
+    changes = changelog.get("changes") or []
+    run_id = (
+        str(changes[0].get("run_id"))
+        if changes and isinstance(changes[0], dict) and changes[0].get("run_id")
+        else None
+    )
+    for entry in skill_phase_entries(workspace, skill, run_id):
+        if (
+            entry.get("phase") == "verification"
+            and entry.get("finding_id") == cluster
+            and entry.get("op_index") == op_index
+        ):
+            return entry
+    return None
+
+
+def detach_skill_changelogs(workspace: Path) -> None:
+    """Move changelog lists off metadata and onto the append-only files."""
+    path = workspace / "target/to_be_improved_skills_metadata/metadata.json"
+    if not path.is_file():
+        return
+    try:
+        document = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return
+    rows = document.get("skills_metadata")
+    if not isinstance(rows, list):
+        return
+    moved = False
+    directory = workspace / SKILL_CHANGELOG_DIR
+    for row in rows:
+        if not isinstance(row, dict) or "changelog" not in row:
+            continue
+        history = row.pop("changelog")
+        moved = True
+        skill = row.get("skill")
+        if isinstance(skill, str) and isinstance(history, list):
+            append_changelog_lines(directory, skill, lines_from_history(history))
+    if moved:
+        atomic_write_json(path, document)
+
+
+def sync_skill_changelogs(workspace: Path) -> None:
+    """Append diagnosis, goal, and verification onto each skill changelog."""
+    detach_skill_changelogs(workspace)
+    path = workspace / "target/to_be_improved_skills_metadata/metadata.json"
+    if not path.is_file():
+        return
+    try:
+        document = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return
+    rows = document.get("skills_metadata")
+    if not isinstance(rows, list):
+        return
+    names: list[str] = []
+    run_root = workspace / "run"
+    if run_root.is_dir():
+        for goal_path in run_root.glob("*/evolve-goal.json"):
+            for name in _changelog_skills(workspace, goal_path.parent.name):
+                if name not in names:
+                    names.append(name)
+    present = {
+        row.get("skill")
+        for row in rows
+        if isinstance(row, dict)
+    }
+    directory = workspace / SKILL_CHANGELOG_DIR
+    for skill in names:
+        if skill not in present:
+            continue
+        append_changelog_lines(
+            directory,
+            skill,
+            [
+                line
+                for entry in skill_phase_entries(workspace, skill)
+                if (line := _phase_line(entry))
+            ],
+        )
+
+
+def _row_without_changelog(row: dict, directory: Path) -> dict:
+    row = copy.deepcopy(row)
+    history = row.pop("changelog", None)
+    skill = row.get("skill")
+    if isinstance(skill, str) and isinstance(history, list):
+        append_changelog_lines(directory, skill, lines_from_history(history))
+    return row
+
+
+def update_candidate_pool(
+    workspace: Path,
+    names: set[str],
+    inventory: Path | None = None,
+) -> list[dict[str, object]]:
+    """Write accepted creates and updates into the candidate pool.
+
+    A name with no skill directory left in the run is removed from the pool.
+    Its changelog file stays.
+    """
+    detach_skill_changelogs(workspace)
+    root = inventory or active_inventory_root()
+    skills_src = workspace / "target/to_be_improved_skills"
+    skills_dest = root / "candidate_skills"
+    meta_src = workspace / "target/to_be_improved_skills_metadata/metadata.json"
+    meta_dest = root / "candidate_skills_metadata/metadata.json"
+    run_logs = workspace / SKILL_CHANGELOG_DIR
+    pool_logs = root / POOL_CHANGELOG_DIR
+    skills_dest.mkdir(parents=True, exist_ok=True)
+    incoming: dict[str, dict] = {}
+    if meta_src.is_file():
+        try:
+            document = json.loads(meta_src.read_text())
+        except json.JSONDecodeError:
+            document = {}
+        incoming = {
+            str(row["skill"]): row
+            for row in document.get("skills_metadata") or []
+            if isinstance(row, dict) and isinstance(row.get("skill"), str)
+        }
+    current: dict[str, dict] = {}
+    if meta_dest.is_file():
+        try:
+            document = json.loads(meta_dest.read_text())
+        except json.JSONDecodeError:
+            document = {}
+        current = {
+            str(row["skill"]): _row_without_changelog(row, pool_logs)
+            for row in document.get("skills_metadata") or []
+            if isinstance(row, dict) and isinstance(row.get("skill"), str)
+        }
+    retirement_archives: list[dict[str, object]] = []
+    for name in sorted(names):
+        merge_changelog_file(
+            run_logs / f"{name}.md", pool_logs / f"{name}.md"
+        )
+        source = skills_src / name
+        destination = skills_dest / name
+        if source.is_dir() and (source / "SKILL.md").is_file():
+            problems = validate_inventory_skill(source)
+            if problems:
+                raise SystemExit(
+                    f"refusing to publish invalid skill {name}: "
+                    + "; ".join(problems)
+                )
+            if destination.exists():
+                shutil.rmtree(destination)
+            shutil.copytree(
+                source,
+                destination,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".DS_Store"),
+            )
+            if name in incoming:
+                current[name] = _row_without_changelog(incoming[name], pool_logs)
+        else:
+            if destination.exists():
+                run_digest = hashlib.sha256(workspace.name.encode()).hexdigest()[:12]
+                archive = root / "quarantine/retired" / name / run_digest
+                if archive.exists():
+                    if skill_content_sha256(archive / "skill") != skill_content_sha256(destination):
+                        raise SystemExit(
+                            f"retirement archive collision for {name}: {archive}"
+                        )
+                else:
+                    archive.parent.mkdir(parents=True, exist_ok=True)
+                    archive.mkdir()
+                    shutil.copytree(destination, archive / "skill")
+                    changelog = pool_logs / f"{name}.md"
+                    if changelog.is_file():
+                        shutil.copy2(changelog, archive / "changelog.md")
+                manifest = {
+                    "schema_version": 1,
+                    "skill": name,
+                    "run_id": workspace.name,
+                    "archive": archive.relative_to(root).as_posix(),
+                    "content_sha256": skill_content_sha256(destination),
+                    "metadata": current.get(name),
+                    "recoverable": True,
+                }
+                atomic_write_json(archive / "retirement.json", manifest)
+                retirement_archives.append(manifest)
+                shutil.rmtree(destination)
+            current.pop(name, None)
+    meta_dest.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(
+        meta_dest,
+        {
+            "skills_metadata": [
+                current[name] for name in sorted(current, key=str.casefold)
+            ]
+        },
+    )
+    inventory_store.snapshot(root)
+    return retirement_archives
+
+
+def publish_inventory(
+    workspace: Path, inventory: Path | None = None
+) -> None:
+    """Copy accepted skills, metadata, and changelogs out of the run."""
+    detach_skill_changelogs(workspace)
+    root = inventory or active_inventory_root()
+    skills_src = workspace / "target/to_be_improved_skills"
+    meta_src = workspace / "target/to_be_improved_skills_metadata/metadata.json"
+    skills_dest = root / "candidate_skills"
+    meta_dest = root / "candidate_skills_metadata/metadata.json"
+    pool_logs = root / POOL_CHANGELOG_DIR
+    run_logs = workspace / SKILL_CHANGELOG_DIR
+    copied_skills: list[str] = []
+    invalid_skills: list[dict[str, object]] = []
+    if skills_src.is_dir():
+        copied_skills, invalid_skills = copy_valid_skill_inventory(
+            skills_src, skills_dest
+        )
+    atomic_write_json(
+        workspace / "run/inventory-publication-validation.json",
+        {
+            "schema_version": 1,
+            "copied_skills": copied_skills,
+            "invalid_skills": invalid_skills,
+        },
+    )
+    if run_logs.is_dir():
+        for path in sorted(run_logs.glob("*.md")):
+            merge_changelog_file(path, pool_logs / path.name)
+    if not meta_src.is_file():
+        return
+    try:
+        incoming = json.loads(meta_src.read_text())
+    except json.JSONDecodeError:
+        return
+    rows = [
+        _row_without_changelog(row, pool_logs)
+        for row in incoming.get("skills_metadata") or []
+        if isinstance(row, dict)
+        and isinstance(row.get("skill"), str)
+        and row["skill"] in copied_skills
+    ]
+    by_name = {str(row["skill"]): row for row in rows}
+    if meta_dest.is_file():
+        try:
+            current = json.loads(meta_dest.read_text())
+        except json.JSONDecodeError:
+            current = {}
+        for row in current.get("skills_metadata") or []:
+            if (
+                isinstance(row, dict)
+                and isinstance(row.get("skill"), str)
+                and row["skill"] not in by_name
+            ):
+                by_name[row["skill"]] = _row_without_changelog(row, pool_logs)
+    meta_dest.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(
+        meta_dest,
+        {
+            "skills_metadata": [
+                by_name[name]
+                for name in sorted(by_name, key=str.casefold)
+            ]
+        },
+    )
+    inventory_store.snapshot(root)
+
+
+OPTIMIZE_INPUT = Path("optimize-input")
+
+
+def optimize_written_and_removed(op: dict) -> tuple[list[str], list[str]]:
+    """Skill directories this op writes, and skill directories it removes."""
+    operation = op.get("op")
+    names = skill_names_mod.skill_names(op)
+    if operation == "delete":
+        return [], names
+    if operation == "merge":
+        target = (op.get("into") or {}).get("skill")
+        written = [target] if isinstance(target, str) and target else []
+        return written, [name for name in names if name not in written]
+    if operation == "split":
+        written = [
+            row.get("skill")
+            for row in op.get("into") or []
+            if isinstance(row, dict) and isinstance(row.get("skill"), str)
+        ]
+        source = op.get("skill")
+        removed = (
+            [source]
+            if isinstance(source, str) and source not in written
+            else []
+        )
+        return written, removed
+    if operation == "update":
+        return names, []
+    return names, []
+
+
+def snapshot_optimize_sources(workspace: Path, op: dict) -> None:
+    """Copy source skills to raw_skills before the optimize session."""
+    if op.get("op") == "create":
+        return
+    improved = workspace / "target/to_be_improved_skills"
+    raw = workspace / "target/raw_skills"
+    for name in skill_names_mod.skill_names(op):
+        source = improved / name
+        if not source.is_dir() or not (source / "SKILL.md").is_file():
+            continue
+        destination = raw / name
+        if destination.exists():
+            shutil.rmtree(destination)
+        shutil.copytree(source, destination)
+
+
+def prepare_optimize_input(workspace: Path, op: dict) -> Path:
+    """Temp directory with each target skill and its changelog beside it."""
+    root = workspace / OPTIMIZE_INPUT
+    if root.exists():
+        shutil.rmtree(root)
+    root.mkdir(parents=True)
+    if op.get("op") in {"create", "merge", "split"}:
+        if not (COMPLETE_SKILL_TEMPLATE / "SKILL.md").is_file():
+            raise RuntimeError(
+                f"complete skill template is missing: {COMPLETE_SKILL_TEMPLATE}"
+            )
+        shutil.copytree(COMPLETE_SKILL_TEMPLATE, root / OPTIMIZE_TEMPLATE_DIR)
+    improved = workspace / "target/to_be_improved_skills"
+    logs = workspace / SKILL_CHANGELOG_DIR
+    for name in skill_names_mod.skill_names(op):
+        append_changelog_lines(
+            logs,
+            name,
+            [
+                line
+                for entry in skill_phase_entries(workspace, name)
+                if entry.get("phase") != "verification"
+                and (line := _phase_line(entry))
+            ],
+        )
+        source = improved / name
+        if source.is_dir() and (source / "SKILL.md").is_file():
+            shutil.copytree(source, root / name)
+        changelog = logs / f"{name}.md"
+        aside = root / f"{name}.md"
+        if changelog.is_file():
+            shutil.copy2(changelog, aside)
+        else:
+            aside.write_text(f"# {name}\n")
+    return root
+
+
+def collect_optimize_input(workspace: Path, op: dict) -> None:
+    """Copy edited skill directories back. Leave changelog files behind."""
+    root = workspace / OPTIMIZE_INPUT
+    improved = workspace / "target/to_be_improved_skills"
+    improved.mkdir(parents=True, exist_ok=True)
+    written, removed = optimize_written_and_removed(op)
+    for name in written:
+        source = root / name
+        if not source.is_dir() or not (source / "SKILL.md").is_file():
+            continue
+        destination = improved / name
+        if destination.exists():
+            shutil.rmtree(destination)
+        shutil.copytree(source, destination)
+    for name in removed:
+        destination = improved / name
+        if destination.exists():
+            shutil.rmtree(destination)
+
+
+def finding_resource_contracts(workspace: Path, cluster: str) -> dict[str, object]:
+    """Return authoritative resource contracts that must survive Goal reduction."""
+    path = workspace / "traces/derived/findings" / cluster / "finding.json"
+    try:
+        finding = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    features = finding.get("features") if isinstance(finding, dict) else None
+    if not isinstance(features, dict):
+        return {}
+    contracts = {
+        name: copy.deepcopy(features[name])
+        for name in (
+            "script_contract",
+            "reference_contract",
+            "asset_contract",
+            "agent_contract",
+        )
+        if isinstance(features.get(name), dict)
+    }
+    if contracts:
+        contracts["resource"] = features.get("resource")
+        contracts["resource_family"] = features.get("resource_family")
+    return contracts
+
+
+def optimize_session_context(
+    cluster: str,
+    op_index: int,
+    op: dict,
+    bundle_note: str,
+    resource_contracts: dict[str, object] | None = None,
+) -> str:
+    names = skill_names_mod.skill_names(op)
+    listed = ", ".join(f"`{name}/` and `{name}.md`" for name in names)
+    template_note = ""
+    if op.get("op") in {"create", "merge", "split"}:
+        template_note = (
+            " A complete structural reference is available at "
+            "`_templates/complete-skill/`. Inspect it when deciding file shape, "
+            "but do not edit or publish it and do not copy resources that the "
+            "operation did not request."
+        )
+    contract_note = ""
+    if resource_contracts:
+        contract_note = (
+            "\n\nAuthoritative resource contract from the finding (the Goal summary "
+            "does not replace it):\n"
+            f"{json.dumps(resource_contracts, ensure_ascii=False, indent=2)}\n"
+            "When content_available is true, write that content exactly (format-only "
+            "JSON/YAML changes are allowed). Do not reconstruct, summarize, omit, or "
+            "invent fields. When it is false, obey allowed_artifact and do not present "
+            "a placeholder as captured source content."
+        )
+    return (
+        f"This isolated session is cluster <{cluster}>, action.ops item "
+        f"{op_index}: {json.dumps(op, ensure_ascii=False)}. "
+        f"workspace/ contains {listed}.{template_note} "
+        "Each `.md` file beside a skill directory is that skill's changelog, "
+        "not the skill. Read it. Do not edit it. Edit only the skill directory. "
+        f"Do not read or write metadata.{bundle_note}{contract_note}\n\n"
+        f"{OPTIMIZE_AVOIDANCE}"
+    )
+
+
+def execute(args: argparse.Namespace) -> None:
+    global ACTIVE_BACKEND, ACTIVE_EXECUTION_CONFIG, ACTIVE_EMBEDDING_PROVIDER
+    global ACTIVE_RUN_DEADLINE_MONOTONIC, ACTIVE_INVENTORY_ROOT
+    previous_inventory_root = ACTIVE_INVENTORY_ROOT
+    tenant_id = privacy.validate_tenant_id(getattr(args, "tenant", "default"))
+    ACTIVE_INVENTORY_ROOT = (
+        ROOT / "workspace"
+        if tenant_id == "default"
+        else privacy.tenant_root(ROOT / "workspace/tenants", tenant_id)
+    )
+    workspace = (ACTIVE_INVENTORY_ROOT / "runs" / args.run_id).resolve()
+    if args.init:
+        try:
+            initialize_workspace(workspace)
+            return
+        finally:
+            ACTIVE_INVENTORY_ROOT = previous_inventory_root
+    if getattr(args, "inventory_only", False) and not workspace.exists():
+        initialize_inventory_workspace(workspace)
+    require_path(workspace, "run workspace")
+    resuming = bool(getattr(args, "resume_from", None))
+    if resuming:
+        if not workspace_was_started(workspace):
+            raise SystemExit(f"{workspace.name} has not been started")
+    else:
+        require_path(
+            workspace / "target/to_be_improved_skills",
+            "existing skills directory",
+        )
+        if getattr(args, "inventory_only", False):
+            require_skill_inputs(workspace)
+        else:
+            require_seed_inputs(workspace)
+        workspace = allocate_execution_workspace(workspace)
+        args.run_id = workspace.name
+    try:
+        profile_path, deployment_profile = resolve_profile(
+            INSTALL_ROOT, getattr(args, "pipeline_profile", "full-agent")
+        )
+        super_config = load_super_config(INSTALL_ROOT / "config/super-config.json")
+        service_tiers = load_service_tiers(INSTALL_ROOT / "config/service-tiers.json")
+        execution_config = resolve_execution_config(
+            deployment_profile, super_config, service_tiers
+        )
+    except (ProfileError, SuperConfigError, ServiceTierError) as error:
+        raise SystemExit(str(error)) from error
+    profile_snapshot = workspace / "run/config/pipeline-profile.json"
+    atomic_write_json(profile_snapshot, deployment_profile)
+    atomic_write_json(workspace / "run/config/execution-config.json", execution_config)
+    ACTIVE_EXECUTION_CONFIG = execution_config
+    configure_run_deadline(workspace)
+    embedding_runtime = (
+        None
+        if getattr(args, "inventory_only", False)
+        else deployment_profile.get("embedding_runtime")
+    )
+    if isinstance(embedding_runtime, dict):
+        try:
+            validate_embedding_runtime(embedding_runtime)
+            ACTIVE_EMBEDDING_PROVIDER = EmbeddingProvider(
+                embedding_runtime,
+                INSTALL_ROOT / "services/embedding_api/server.py",
+            )
+        except (OSError, RuntimeError, ValueError) as error:
+            if embedding_runtime.get("on_start_error") != "hashing-reference":
+                raise SystemExit(f"cannot start embedding runtime: {error}") from error
+            ACTIVE_EMBEDDING_PROVIDER = EmbeddingProvider(
+                embedding_fallback_config(embedding_runtime),
+                INSTALL_ROOT / "services/embedding_api/server.py",
+            )
+            record_embedding_fallback(workspace, embedding_runtime, error)
+    else:
+        ACTIVE_EMBEDDING_PROVIDER = None
+    write_envelope(
+        workspace / "run/status/control-plane/profile.json",
+        build_envelope(
+            run_id=args.run_id,
+            phase="control-plane",
+            item_id="profile",
+            implementation={
+                "kind": "deterministic",
+                "name": "profile-loader",
+                "version": "1",
+                "config_digest": deployment_profile["config_digest"],
+            },
+            status="completed",
+            started_at=datetime.now(UTC).isoformat(),
+            output_ref=artifact_ref(profile_snapshot, relative_to=workspace),
+            decision={
+                "disposition": "selected",
+                "mode": "enabled",
+                "reason_codes": [deployment_profile["name"]],
+            },
+            measurements={"wall_ms": 0},
+        ),
+    )
+    print(f"pipeline profile: {deployment_profile['name']} ({profile_path})")
+    ACTIVE_BACKEND = select_backend(args.agent, args.allow_local_fallback)
+    args.model = configured_model(ACTIVE_BACKEND, args.model)
+    print(f"selected model: {args.model}")
+    auth = require_auth() if ACTIVE_BACKEND == "docker-claude" else {}
+    if args.build:
+        build_images()
+
+    workflow: StateMachineRuntime | None = None
+
+    def move(decision: TransitionDecision) -> None:
+        if workflow is None:
+            return
+        workflow.transition(decision)
+        atomic_write_json(
+            workspace / "run/state-machine/snapshot.json", workflow.snapshot()
+        )
+
+    try:
+        if ACTIVE_EMBEDDING_PROVIDER is not None:
+            try:
+                ACTIVE_EMBEDDING_PROVIDER.start()
+            except (OSError, RuntimeError, ValueError) as error:
+                if (
+                    not isinstance(embedding_runtime, dict)
+                    or embedding_runtime.get("on_start_error")
+                    != "hashing-reference"
+                ):
+                    raise
+                ACTIVE_EMBEDDING_PROVIDER.stop()
+                ACTIVE_EMBEDDING_PROVIDER = EmbeddingProvider(
+                    embedding_fallback_config(embedding_runtime),
+                    INSTALL_ROOT / "services/embedding_api/server.py",
+                )
+                ACTIVE_EMBEDDING_PROVIDER.start()
+                record_embedding_fallback(workspace, embedding_runtime, error)
+        if resuming:
+            continue_operations(
+                workspace,
+                args.run_id,
+                args.resume_from,
+                getattr(args, "op_workers", DEFAULT_OP_WORKERS),
+                auth,
+                args.model,
+                not args.agent_installed,
+            )
+            clusters = sorted(
+                path.parent.name
+                for path in (workspace / "run").glob("*/evolve-goal.json")
+                if path.is_file()
+            )
+            if clusters:
+                write_pipeline_summary(workspace, clusters)
+            sync_skill_changelogs(workspace)
+            publish_inventory(workspace)
+            print(
+                f"completed continuation {args.run_id} from "
+                f"{args.resume_from}: {workspace}"
+            )
+            return
+        workflow = StateMachineRuntime(
+            load_machine(INSTALL_ROOT / "config/state-machine.json"),
+            run_id=args.run_id,
+            item_id="pipeline",
+            database=workspace.parents[1] / "optimization.sqlite",
+            journal=workspace / "logs/state-transitions.jsonl",
+        )
+        if getattr(args, "inventory_only", False):
+            move(TransitionDecision("LABEL_SKILLS", "inventory_started", "labels.cached-v1", 1.0))
+            metadata_path = workspace / "target/to_be_improved_skills_metadata/metadata.json"
+            seed_names = skill_inventory_names(
+                workspace / "target/to_be_improved_skills"
+            )
+            detach_skill_changelogs(workspace)
+            with pipeline_metrics.span(
+                workspace,
+                "label-skills",
+                args.run_id,
+                "deterministic",
+                metadata={"mode": "inventory", "skill_count": len(seed_names)},
+            ):
+                try:
+                    pipeline_contracts.validate_metadata(metadata_path, seed_names)
+                except (FileNotFoundError, json.JSONDecodeError, pipeline_contracts.ContractError):
+                    run_session(
+                        "label-skills", workspace,
+                        instruction("label-skills", "Label the complete existing skill set once."),
+                        auth, args.model, not args.agent_installed, args.run_id,
+                    )
+                pipeline_contracts.validate_metadata(metadata_path, seed_names)
+                ensure_lifecycle_evaluation_baselines(metadata_path)
+                complete_session(workspace, "label-skills", args.run_id, [metadata_path])
+            with pipeline_metrics.span(
+                workspace,
+                "inventory-candidates",
+                args.run_id,
+                "deterministic",
+                metadata={"skill_count": len(seed_names)},
+            ):
+                candidates = inventory_merge_candidates(workspace, metadata_path)
+                scopes = materialize_inventory_findings(workspace, candidates)
+            move(TransitionDecision("SELECT_UNITS", "labels_ready", "selection.evidence-gate-v1", 1.0))
+            if not scopes:
+                move(TransitionDecision("COMPLETE", "no_units", probability=1.0))
+                write_pipeline_summary(workspace, [])
+                publish_inventory(workspace)
+                print(f"completed inventory run {args.run_id}: no maintenance candidates")
+                return
+            move(TransitionDecision("DIAGNOSE", "units_selected", "diagnosis.inventory-v1", 1.0))
+            move(TransitionDecision("RECALL", "diagnosis_complete", "recall.inventory-v1", 1.0))
+            fanout_goals(
+                workspace, args.run_id, scopes, True,
+                getattr(args, "cluster_workers", DEFAULT_CLUSTER_WORKERS),
+                auth, args.model, not args.agent_installed, "finding",
+            )
+            move(TransitionDecision("GOAL", "recall_complete", deployment_profile["phases"]["goal"]["algorithm"], 1.0))
+            has_operations = any(
+                goal_ops(workspace / "run" / scope / "evolve-goal.json")
+                for scope in scopes
+            )
+            if has_operations:
+                move(TransitionDecision("OPTIMIZE", "change_proposed", deployment_profile["phases"]["optimize"]["algorithm"], 1.0))
+            fanout_operations(
+                workspace, args.run_id, scopes,
+                getattr(args, "op_workers", DEFAULT_OP_WORKERS), auth, args.model,
+                not args.agent_installed, getattr(args, "max_ops_per_skill", None),
+                getattr(args, "min_super_score", None),
+            )
+            if has_operations:
+                move(TransitionDecision("VERIFY", "candidate_ready", deployment_profile["phases"]["verify"]["algorithm"], 1.0))
+                move(TransitionDecision("PUBLISH", "verified", deployment_profile["phases"]["publish"]["algorithm"], 1.0))
+                move(TransitionDecision("COMPLETE", "published", probability=1.0))
+            else:
+                move(TransitionDecision("COMPLETE", "no_change", probability=1.0))
+            write_pipeline_summary(workspace, scopes)
+            sync_skill_changelogs(workspace)
+            publish_inventory(workspace)
+            print(f"completed inventory run {args.run_id}: {workspace}")
+            return
+        move(
+            TransitionDecision(
+                "NORMALIZE", "run_started", "normalize.vendor-json-v1", 1.0
+            )
+        )
+        write_status(workspace, "preprocessing", args.run_id, "started")
+        config_path = ROOT / "common/preprocessing-config.json"
+        try:
+            mining_result = mining_engine.run(
+                workspace,
+                config_path,
+                clustered=args.cluster,
+                profile_name=getattr(args, "mining_profile", None),
+                experiment_profiles=getattr(args, "experiment_profile", None),
+                span_factory=pipeline_metrics.span,
+            )
+            active_clustered = bool(
+                mining_result["active"]["clustering"]["cluster_count"]
+            )
+            if getattr(args, "review_clusters", False):
+                run_session(
+                    "preprocessing",
+                    workspace,
+                    instruction(
+                        "preprocessing",
+                        (
+                            "Review only the canonical turns and pointer manifests. "
+                            "Improve unclear cluster directory names when useful and "
+                            "update each manifest record's cluster field to match. "
+                            "Do not read raw vendor JSONL or copy trace payloads."
+                        ),
+                        cluster=active_clustered,
+                    ),
+                    auth,
+                    args.model,
+                    not args.agent_installed,
+                    args.run_id,
+                )
+        except BaseException as error:
+            write_status(
+                workspace,
+                "preprocessing",
+                args.run_id,
+                "failed",
+                error=failure_text(error),
+            )
+            raise
+        with pipeline_metrics.span(
+            workspace,
+            "validate-preprocessing",
+            args.run_id,
+            "deterministic",
+        ):
+            preprocessing_outputs = validate_preprocessing(
+                workspace, active_clustered
+            )
+        complete_session(
+            workspace, "preprocessing", args.run_id, preprocessing_outputs
+        )
+        move(
+            TransitionDecision(
+                "DETECT", "normalized", "detect.rules-v1", 1.0
+            )
+        )
+        move(
+            TransitionDecision(
+                "POLICY", "findings_ready", "policy.fixed-v1", 1.0
+            )
+        )
+        deployment_profile, compiled_policy = compile_runtime_policy(
+            workspace,
+            args.run_id,
+            deployment_profile,
+            execution_config,
+        )
+        execution_config = resolve_execution_config(
+            deployment_profile, super_config, service_tiers
+        )
+        ACTIVE_EXECUTION_CONFIG = execution_config
+        atomic_write_json(
+            workspace / "run/config/execution-config.json", execution_config
+        )
+        semantic_mode = deployment_profile["phases"]["semantic_prefilter"]["mode"]
+        if semantic_mode in {"observe", "enabled"}:
+            move(
+                TransitionDecision(
+                    "SEMANTIC_FILTER",
+                    "semantic_observe" if semantic_mode == "observe" else "semantic_enabled",
+                    deployment_profile["phases"]["semantic_prefilter"]["algorithm"],
+                    1.0,
+                )
+            )
+            run_semantic_prefilter_observer(
+                workspace, args.run_id, deployment_profile
+            )
+            move(
+                TransitionDecision(
+                    "LABEL_SKILLS", "filter_complete", probability=1.0
+                )
+            )
+        else:
+            move(
+                TransitionDecision(
+                    "LABEL_SKILLS", "semantic_bypassed", probability=1.0
+                )
+            )
+
+        # Selection is trace-only. Resolve it before inventory labeling so a
+        # run whose findings were deterministically suppressed does not spend
+        # an agent call rebuilding labels that no downstream phase will use.
+        unit_kind = getattr(args, "evolution_unit", "cluster")
+        clusters = evolution_units(workspace, active_clustered, unit_kind)
+        if unit_kind == "finding":
+            clusters = low_cost_allowed_scopes(
+                workspace, clusters, deployment_profile
+            )
+        refuse_blocked_scopes(workspace, active_clustered, unit_kind)
+        if not clusters:
+            with pipeline_metrics.span(
+                workspace,
+                "label-skills",
+                args.run_id,
+                "deterministic",
+                metadata={"skipped": True, "reason": "no_evolution_units"},
+            ):
+                pass
+            move(
+                TransitionDecision(
+                    "SELECT_UNITS", "labels_ready", probability=1.0,
+                    metadata={"labels_skipped": True, "reason": "no_evolution_units"},
+                )
+            )
+            move(TransitionDecision("COMPLETE", "no_units", probability=1.0))
+            write_pipeline_summary(workspace, [])
+            publish_inventory(workspace)
+            print(
+                f"completed run {args.run_id}: no evolution units remained after "
+                "the configured selection and infrastructure filters"
+            )
+            return
+
+        metadata_path = (
+            workspace / "target/to_be_improved_skills_metadata/metadata.json"
+        )
+        seed_names = skill_inventory_names(
+            workspace / "target/to_be_improved_skills"
+        )
+        detach_skill_changelogs(workspace)
+        try:
+            pipeline_contracts.validate_metadata(metadata_path, seed_names)
+        except (FileNotFoundError, json.JSONDecodeError, pipeline_contracts.ContractError):
+            run_session(
+                "label-skills",
+                workspace,
+                instruction(
+                    "label-skills", "Label the complete existing skill set once."
+                ),
+                auth,
+                args.model,
+                not args.agent_installed,
+                args.run_id,
+            )
+        else:
+            with pipeline_metrics.span(
+                workspace,
+                "label-skills",
+                args.run_id,
+                "deterministic",
+                metadata={"reused": True},
+            ):
+                pass
+            print("reused validated skill metadata", flush=True)
+        with pipeline_metrics.span(
+            workspace,
+            "validate-skill-labels",
+            args.run_id,
+            "deterministic",
+        ):
+            detach_skill_changelogs(workspace)
+            pipeline_contracts.validate_metadata(metadata_path, seed_names)
+        inventory_merge_candidates(workspace, metadata_path)
+        complete_session(workspace, "label-skills", args.run_id, [metadata_path])
+        move(
+            TransitionDecision(
+                "SELECT_UNITS", "labels_ready", "selection.evidence-gate-v1", 1.0
+            )
+        )
+
+        move(
+            TransitionDecision(
+                "DIAGNOSE",
+                "units_selected",
+                deployment_profile["phases"]["diagnosis"]["algorithm"],
+                1.0,
+                metadata={"unit_count": len(clusters), "unit_kind": unit_kind},
+            )
+        )
+        scope_clustered = active_clustered or unit_kind == "finding"
+        cluster_workers = getattr(args, "cluster_workers", DEFAULT_CLUSTER_WORKERS)
+        op_workers = getattr(args, "op_workers", DEFAULT_OP_WORKERS)
+        pipeline_diagnosis_and_goals(
+            workspace,
+            args.run_id,
+            clusters,
+            scope_clustered,
+            cluster_workers,
+            auth,
+            args.model,
+            not args.agent_installed,
+            unit_kind,
+        )
+        move(
+            TransitionDecision(
+                "RECALL",
+                "diagnosis_complete",
+                deployment_profile["phases"]["recall"]["algorithm"],
+                1.0,
+            )
+        )
+        move(
+            TransitionDecision(
+                "GOAL",
+                "recall_complete",
+                deployment_profile["phases"]["goal"]["algorithm"],
+                1.0,
+            )
+        )
+        successful_clusters = [
+            cluster
+            for cluster in clusters
+            if (workspace / "run" / cluster / "evolve-goal.json").is_file()
+        ]
+        has_operations = any(
+            ((json.loads((workspace / "run" / cluster / "evolve-goal.json").read_text()).get("action") or {}).get("ops") or [])
+            for cluster in successful_clusters
+        )
+        if has_operations:
+            move(
+                TransitionDecision(
+                    "OPTIMIZE",
+                    "change_proposed",
+                    deployment_profile["phases"]["optimize"]["algorithm"],
+                    1.0,
+                )
+            )
+        fanout_operations(
+            workspace,
+            args.run_id,
+            successful_clusters,
+            op_workers,
+            auth,
+            args.model,
+            not args.agent_installed,
+            getattr(args, "max_ops_per_skill", None),
+            getattr(args, "min_super_score", None),
+        )
+        if has_operations:
+            move(
+                TransitionDecision(
+                    "VERIFY",
+                    "candidate_ready",
+                    deployment_profile["phases"]["verify"]["algorithm"],
+                    1.0,
+                )
+            )
+            move(
+                TransitionDecision(
+                    "PUBLISH",
+                    "verified",
+                    deployment_profile["phases"]["publish"]["algorithm"],
+                    1.0,
+                )
+            )
+            move(TransitionDecision("COMPLETE", "published", probability=1.0))
+        else:
+            move(TransitionDecision("COMPLETE", "no_change", probability=1.0))
+        write_pipeline_summary(workspace, successful_clusters)
+        sync_skill_changelogs(workspace)
+        publish_inventory(workspace)
+
+        print(f"completed run {args.run_id}: {workspace}")
+
+    finally:
+        ACTIVE_INVENTORY_ROOT = previous_inventory_root
+        ACTIVE_RUN_DEADLINE_MONOTONIC = None
+        if ACTIVE_EMBEDDING_PROVIDER is not None:
+            ACTIVE_EMBEDDING_PROVIDER.stop()
+            ACTIVE_EMBEDDING_PROVIDER = None
+        try:
+            atomic_write_json(
+                workspace / "logs/phase-adapter-metrics.json",
+                summarize_phase_envelopes(workspace),
+            )
+        except Exception as error:
+            print(f"phase adapter metrics failed: {error}", file=sys.stderr)
+        report_path = pipeline_metrics.write_run_report(workspace)
+        try:
+            report = json.loads(report_path.read_text())
+            resource_learning_metrics = (
+                ((report.get("phase_metrics") or {}).get("phases") or {}).get(
+                    "resources", {}
+                )
+            )
+            StudyStore(workspace.parents[1] / "optimization.sqlite").record_run(
+                workspace.name,
+                str(ACTIVE_EXECUTION_CONFIG.get("config_digest") or "unknown"),
+                {"overrides": {}},
+                {"resource_usefulness": resource_learning_metrics},
+                {"runtime_report": report, "source": "pipeline-finalizer"},
+            )
+        except Exception as error:
+            print(f"online learning run capture failed: {error}", file=sys.stderr)
+        try:
+            pipeline_metrics.write_phase_metrics_summary(workspace.parent)
+        except Exception as error:
+            print(
+                f"phase metrics summary failed: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("run_id", help="directory name under workspace/runs")
+    parser.add_argument(
+        "--tenant",
+        default="default",
+        help="isolated tenant namespace (default keeps the legacy workspace)",
+    )
+    parser.add_argument(
+        "--init", action="store_true", help="create the run workspace and stop"
+    )
+    parser.add_argument(
+        "--inventory-only",
+        action="store_true",
+        help="inspect, merge, and optimize the current skill inventory without traces",
+    )
+    parser.add_argument(
+        "--from",
+        dest="resume_from",
+        choices=("optimize", "verification", "judge"),
+        help=(
+            "continue a stamped run from optimize, verification, or judge "
+            "for every eligible operation that was not accepted"
+        ),
+    )
+    parser.add_argument(
+        "--build", action="store_true", help="build the shared agent runtime image"
+    )
+    parser.add_argument(
+        "--cluster", action="store_true", help="run clustering and fan out by cluster"
+    )
+    parser.add_argument(
+        "--review-clusters",
+        action="store_true",
+        help="ask the preprocessing agent to review deterministic cluster names",
+    )
+    parser.add_argument(
+        "--mining-profile",
+        help="override active_profile from preprocessing-config.json",
+    )
+    parser.add_argument(
+        "--pipeline-profile",
+        default="full-agent",
+        help=(
+            "deployment profile name under profiles/ or a JSON path "
+            "(default: full-agent)"
+        ),
+    )
+    parser.add_argument(
+        "--experiment-profile",
+        action="append",
+        default=[],
+        help="run a named profile in an isolated experiment namespace; repeatable",
+    )
+    parser.add_argument(
+        "--evolution-unit",
+        choices=("finding", "cluster"),
+        default="finding",
+        help="fan out by selected high-confidence finding or topic cluster",
+    )
+    parser.add_argument(
+        "--cluster-workers",
+        type=int,
+        default=DEFAULT_CLUSTER_WORKERS,
+        help=(
+            "maximum combined diagnosis and goal workers; a finding's goal "
+            "starts when its diagnosis finishes"
+        ),
+    )
+    parser.add_argument(
+        "--op-workers",
+        type=int,
+        default=DEFAULT_OP_WORKERS,
+        help="maximum isolated non-conflicting operation workers",
+    )
+    parser.add_argument(
+        "--max-ops-per-skill",
+        type=int,
+        help=(
+            "merge up to this many update edits of the same skill into one "
+            "optimize, verify, and judge pass "
+            "(default: evolution_policy.max_ops_per_skill, currently 3)"
+        ),
+    )
+    parser.add_argument(
+        "--min-super-score",
+        type=float,
+        help=(
+            "same-skill edits below this super score do not join the bundle "
+            "(default: evolution_policy.min_super_score, currently 0.65)"
+        ),
+    )
+    parser.add_argument(
+        "--model",
+        help="override the model of the selected agent config entry",
+    )
+    parser.add_argument(
+        "--agent",
+        choices=("auto", *KNOWN_BACKENDS),
+        default="auto",
+        help="agent backend; auto uses the single active entry in agent-config.json",
+    )
+    parser.add_argument(
+        "--allow-local-fallback",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--agent-installed",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    args = parser.parse_args()
+    if args.resume_from and args.init:
+        parser.error("--from cannot be combined with --init")
+    stamped = re.fullmatch(
+        r"[A-Za-z0-9_.-]+@[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}(?:-[0-9]+)?",
+        args.run_id,
+    )
+    if args.resume_from:
+        if not stamped:
+            parser.error(
+                "--from requires the stamped run directory name, "
+                "such as run-id@YYYY-MM-DDTHH:MM"
+            )
+    elif not re.fullmatch(r"[A-Za-z0-9_.-]+", args.run_id):
+        parser.error(
+            "run_id may contain only letters, numbers, dot, underscore, dash"
+        )
+    if args.cluster_workers < 1 or args.op_workers < 1:
+        parser.error("worker counts must be at least 1")
+    if args.max_ops_per_skill is not None and args.max_ops_per_skill < 1:
+        parser.error("max_ops_per_skill must be at least 1")
+    if args.min_super_score is not None and args.min_super_score < 0:
+        parser.error("min_super_score must be non-negative")
+    return args
+
+
+if __name__ == "__main__":
+    try:
+        execute(parse_args())
+    except subprocess.CalledProcessError as error:
+        sys.exit(error.returncode)
