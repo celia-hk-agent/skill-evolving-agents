@@ -2,3 +2,9 @@ local/
 __pycache__/
 *.pyc
 .pipeline-workers/
+
+# Generated local state
+workspace/metrics.sqlite-shm
+workspace/metrics.sqlite-wal
+workspace/active-inventory.json
+workspace/inventory_releases/
